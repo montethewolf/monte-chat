@@ -1,0 +1,15 @@
+[Unit]
+Description=hlv-discord voice bridge (Discord voice <-> Hermes Live Voice)
+After=network-online.target dev.hermes-live-voice.gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env node %h/Development/monte-chat/src/index.js
+EnvironmentFile=%h/.config/hlv-discord/env
+WorkingDirectory=%h/Development/monte-chat
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

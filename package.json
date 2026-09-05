@@ -1,0 +1,21 @@
+{
+  "name": "hlv-discord",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Discord voice <-> Hermes realtime bridge (via hermes-live-voice gateway)",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.19.2",
+    "discord.js": "^14.27.0",
+    "hermes-live-voice": "^1.1.0",
+    "mediaplex": "^1.0.0",
+    "ws": "^8.21.3"
+  }
+}
