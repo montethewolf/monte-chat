@@ -202,6 +202,85 @@ test("terminates and reconnects when pings go unanswered", async (t) => {
   });
 });
 
+test("a pinned session resumes even when the gateway listing omits it", async (t) => {
+  // Empty listing: the unpinned path would downgrade to mode:"new" (see the
+  // "no longer listed" test above). A pin must skip that pre-validation.
+  await withGateway(t, { conversations: [] }, async (gw, make) => {
+    const stateFile = await tmpState();
+    await writeFile(stateFile, JSON.stringify({ sessionId: "sess_thread" }));
+    const conn = make({ stateFile, pinnedSessionId: "sess_thread" });
+    const readyEvent = eventOnce(conn, "ready");
+    await conn.start();
+    await readyEvent;
+    assert.deepEqual(gw.starts[0].conversation, { mode: "resume", sessionId: "sess_thread" });
+  });
+});
+
+test("rebind() swaps the live session onto a pinned target", async (t) => {
+  await withGateway(t, { conversations: [] }, async (gw, make) => {
+    const stateFile = await tmpState();
+    const conn = make({ stateFile });
+    const first = eventOnce(conn, "ready");
+    await conn.start();
+    await first;
+    assert.equal(gw.starts[0].conversation.mode, "new");
+    const second = eventOnce(conn, "ready");
+    await conn.rebind("sess_focused", { pinned: true });
+    await second;
+    assert.deepEqual(gw.starts[1].conversation, { mode: "resume", sessionId: "sess_focused" });
+    assert.equal(conn.pinnedSessionId, "sess_focused");
+  });
+});
+
+test("rebind(null) unpins and forces a fresh conversation", async (t) => {
+  await withGateway(t, { conversations: [] }, async (gw, make) => {
+    const stateFile = await tmpState();
+    await writeFile(stateFile, JSON.stringify({ sessionId: "sess_prev" }));
+    const conn = make({ stateFile, pinnedSessionId: "sess_prev" });
+    const first = eventOnce(conn, "ready");
+    await conn.start();
+    await first;
+    const second = eventOnce(conn, "ready");
+    await conn.rebind(null);
+    await second;
+    assert.equal(gw.starts[1].conversation.mode, "new");
+    assert.equal(conn.pinnedSessionId, null);
+  });
+});
+
+test("rebind() while stopped persists the target for the next start()", async (t) => {
+  await withGateway(t, { conversations: [] }, async (gw, make) => {
+    const stateFile = await tmpState();
+    const conn = make({ stateFile });
+    await conn.rebind("sess_later", { pinned: true });
+    assert.equal(gw.starts.length, 0, "must not connect while stopped");
+    const saved = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.equal(saved.sessionId, "sess_later");
+    const readyEvent = eventOnce(conn, "ready");
+    await conn.start();
+    await readyEvent;
+    assert.deepEqual(gw.starts[0].conversation, { mode: "resume", sessionId: "sess_later" });
+  });
+});
+
+test("a rejected pinned resume emits resume-fallback and clears the pin", async (t) => {
+  const options = { conversations: [], behavior: { failResumeOnce: true } };
+  await withGateway(t, options, async (gw, make) => {
+    const stateFile = await tmpState();
+    await writeFile(stateFile, JSON.stringify({ sessionId: "sess_dead" }));
+    const conn = make({ stateFile, pinnedSessionId: "sess_dead" });
+    const fallbackEvent = eventOnce(conn, "resume-fallback");
+    const readyEvent = eventOnce(conn, "ready");
+    await conn.start();
+    const fallback = await fallbackEvent;
+    await readyEvent;
+    assert.equal(fallback.sessionId, "sess_dead");
+    assert.equal(conn.pinnedSessionId, null);
+    assert.equal(gw.starts[0].conversation.mode, "resume");
+    assert.equal(gw.starts[1].conversation.mode, "new");
+  });
+});
+
 test("stop() detaches cleanly and keeps the sessionId for later resume", async (t) => {
   await withGateway(t, {}, async (gw, make) => {
     const stateFile = await tmpState();

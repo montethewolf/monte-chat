@@ -66,6 +66,11 @@ export class HlvConnection extends EventEmitter {
     this.desired = false;
     this.client = null;
     this.sessionId = null;
+    // A pinned session skips the listing pre-validation in #chooseConversation:
+    // the gateway's /v1/conversations tops out at 100 rows dominated by cron
+    // sessions, so a deliberately-focused Discord session would be "not found"
+    // there and silently downgraded to mode:"new".
+    this.pinnedSessionId = options.pinnedSessionId ?? null;
   }
 
   get session() {
@@ -98,6 +103,30 @@ export class HlvConnection extends EventEmitter {
       }
     }
     if (this.state !== "halted") this.#setState("idle");
+  }
+
+  // Point the wrapper at a different Hermes session without connecting:
+  // persists the id (so the next start() resumes it) and optionally pins it.
+  // sessionId=null forgets the pin and forces a fresh conversation next start.
+  async adoptSessionId(sessionId, { pinned = false } = {}) {
+    if (sessionId) {
+      this.pinnedSessionId = pinned ? sessionId : null;
+      await this.#saveSessionId(sessionId);
+    } else {
+      this.pinnedSessionId = null;
+      this.#forceNew = true;
+    }
+  }
+
+  // Swap the live session: stop the HLV client, adopt the target, reconnect.
+  // The caller's Discord voice connection is independent and stays up; only
+  // the HLV leg re-handshakes. When not started, this just persists the
+  // target so the next start() opens on it.
+  async rebind(sessionId, { pinned = false } = {}) {
+    const active = this.desired;
+    await this.stop("rebind");
+    await this.adoptSessionId(sessionId, { pinned });
+    if (active && this.state !== "halted") await this.start();
   }
 
   // --- passthroughs (safe while disconnected: drop and report undefined) ---
@@ -211,6 +240,11 @@ export class HlvConnection extends EventEmitter {
       this.#forceNew = false;
       return { mode: "new" };
     }
+    if (this.pinnedSessionId && this.sessionId === this.pinnedSessionId) {
+      // Deliberate focus target: resume without listing pre-validation (see
+      // the constructor note). session_start_failed still falls back once.
+      return { mode: "resume", sessionId: this.sessionId };
+    }
     if (this.sessionId && (await this.#conversationExists(this.sessionId))) {
       return { mode: "resume", sessionId: this.sessionId };
     }
@@ -254,6 +288,13 @@ export class HlvConnection extends EventEmitter {
       // Saved session may be stale despite pre-validation; retry once fresh.
       this.#resumeFallbackUsed = true;
       this.#forceNew = true;
+      if (this.pinnedSessionId && this.pinnedSessionId === this.sessionId) {
+        // A focused session that cannot be resumed: drop the pin and tell the
+        // consumer so focus state is cleared loudly, never silently.
+        const sessionId = this.pinnedSessionId;
+        this.pinnedSessionId = null;
+        this.emit("resume-fallback", { sessionId });
+      }
       this.#attempt();
       return;
     }

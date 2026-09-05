@@ -30,6 +30,16 @@ import mediaplex from "mediaplex";
 import { HlvConnection } from "./hlv-conn.js";
 import { Bridge } from "./bridge.js";
 import { Decimator, Interpolator, monoToStereo, stereoToMono } from "./resample.js";
+import { buildBrief, chunkText } from "./brief.js";
+import {
+  listRecentDiscordThreads,
+  readActiveWork,
+  readCron,
+  readGatewayState,
+  readKanban,
+  resolveThreadSession,
+} from "./hermes-status.js";
+import { clearFocus, loadFocus, saveFocus } from "./focus.js";
 
 const { OpusEncoder } = mediaplex;
 
@@ -57,6 +67,24 @@ function readConfig() {
     mirrorTranscripts: /^(1|true|yes)$/i.test(process.env.MIRROR_TRANSCRIPTS ?? ""),
     textChannelId: process.env.DISCORD_TEXT_CHANNEL_ID || null,
     loopback: process.argv.includes("--loopback"),
+    // Hermes state read-only paths (focus resolution + the call-start brief)
+    hermesHome: process.env.HERMES_HOME ?? join(homedir(), ".hermes"),
+    focusStateFile:
+      process.env.FOCUS_STATE_FILE ?? join(homedir(), ".local", "state", "hlv-discord", "focus.json"),
+    briefEnabled: !/^(0|false|no)$/i.test(process.env.BRIEF_ENABLED ?? ""),
+    briefMaxChars: Number(process.env.BRIEF_MAX_CHARS ?? 1800),
+    briefTtlMin: Number(process.env.BRIEF_TTL_MIN ?? 15),
+  };
+}
+
+function hermesPaths(cfg) {
+  const home = cfg.hermesHome;
+  return {
+    stateDb: process.env.HERMES_STATE_DB ?? join(home, "state.db"),
+    kanbanDb: process.env.HERMES_KANBAN_DB ?? join(home, "kanban.db"),
+    cronDb: process.env.HERMES_CRON_DB ?? join(home, "cron", "executions.db"),
+    cronJobs: process.env.HERMES_CRON_JOBS ?? join(home, "cron", "jobs.json"),
+    gatewayState: process.env.HERMES_GATEWAY_STATE ?? join(home, "gateway_state.json"),
   };
 }
 
@@ -125,6 +153,9 @@ class LoopbackBridge extends EventEmitter {
 
 async function main() {
   const cfg = readConfig();
+  const paths = hermesPaths(cfg);
+  let focusState = await loadFocus(cfg.focusStateFile);
+  if (focusState) log(`focus restored: thread ${focusState.threadId} ("${focusState.title ?? "?"}")`);
 
   // Boot check: DAVE (Discord E2EE) native binding must load, or every voice
   // join will fail as an opaque rejoin loop.
@@ -148,10 +179,17 @@ async function main() {
       url: cfg.hlvUrl,
       token: cfg.hlvToken,
       stateFile: cfg.stateFile,
+      pinnedSessionId: focusState?.sessionId ?? null,
       log,
     });
     bridge = new Bridge({ conn, endPadMs: cfg.endPadMs, log });
-    conn.on("ready", () => log("HLV session ready"));
+    conn.on("ready", (ready) => {
+      log("HLV session ready");
+      maybeSendBrief(ready).catch((err) => log(`brief failed: ${err.message}`));
+    });
+    conn.on("resume-fallback", ({ sessionId }) => {
+      onFocusLost(sessionId).catch((err) => log(`focus-lost handling failed: ${err.message}`));
+    });
     conn.on("backoff", ({ delayMs, failures }) =>
       log(`HLV reconnect in ${delayMs}ms (failure #${failures})`),
     );
@@ -174,14 +212,68 @@ async function main() {
   let boundChannelId = cfg.textChannelId; // text channel for mirrored messages
   let autoFollow = true; // /leave suppresses following until /join or a fresh session
 
+  // Mirror target: the focused thread when focus is set, else the bound channel.
   async function postText(text) {
-    if (!boundChannelId) return;
+    const target = focusState?.threadId ?? boundChannelId;
+    if (!target) return;
     try {
-      const channel = await client.channels.fetch(boundChannelId);
-      await channel.send(text.slice(0, 1900));
+      const channel = await client.channels.fetch(target);
+      for (const part of chunkText(text)) await channel.send(part);
     } catch (err) {
       log(`text mirror failed: ${err.message}`);
     }
+  }
+
+  // --- call-start brief -----------------------------------------------------
+
+  let lastBriefedSessionId = null;
+  let lastBriefAt = 0;
+
+  async function gatherBriefData() {
+    const threads = await listRecentDiscordThreads({
+      hlvUrl: cfg.hlvUrl,
+      hlvToken: cfg.hlvToken,
+      stateDbPath: paths.stateDb,
+    });
+    return {
+      now: new Date(),
+      gateway: readGatewayState(paths.gatewayState),
+      kanban: readKanban(paths.kanbanDb),
+      cron: readCron(paths.cronDb, paths.cronJobs),
+      activeWork: readActiveWork(paths.stateDb),
+      threads,
+      focus: focusState
+        ? { title: focusState.title, messageCount: focusState.messageCount ?? null }
+        : null,
+      maxChars: cfg.briefMaxChars,
+    };
+  }
+
+  async function maybeSendBrief(ready, force = false) {
+    if (!cfg.briefEnabled || !conn) return;
+    const sid = ready?.conversation?.sessionId ?? conn.sessionId ?? null;
+    if (
+      !force &&
+      sid &&
+      sid === lastBriefedSessionId &&
+      Date.now() - lastBriefAt < cfg.briefTtlMin * 60_000
+    ) {
+      return; // transient reconnect on the same session: don't re-bill/re-speak
+    }
+    const brief = buildBrief(await gatherBriefData());
+    if (conn.sendText(brief) === undefined) return; // not connected; next ready retries
+    lastBriefedSessionId = sid;
+    lastBriefAt = Date.now();
+    log(`brief sent (${brief.length} chars${focusState ? ", focused" : ""})`);
+  }
+
+  async function onFocusLost(sessionId) {
+    if (!focusState || focusState.sessionId !== sessionId) return;
+    focusState = null;
+    await clearFocus(cfg.focusStateFile);
+    await postText(
+      "Focus lost: couldn't resume that thread's session; started a fresh voice conversation.",
+    );
   }
 
   bridge.on("text", ({ kind, text }) => {
@@ -325,6 +417,64 @@ async function main() {
     await interaction.reply({ content: "Left.", flags: MessageFlags.Ephemeral });
   }
 
+  async function handleFocus(interaction) {
+    // Rebind takes seconds; the 3s interaction window would otherwise expire.
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    if (!interaction.channel?.isThread?.()) {
+      await interaction.editReply("Run /focus inside a thread.");
+      return;
+    }
+    const resolved = resolveThreadSession(paths.stateDb, interaction.channelId);
+    if (!resolved) {
+      await interaction.editReply(
+        "No Hermes session exists for this thread yet — send Monte a message here first, then /focus. (Or the state DB was busy; try again.)",
+      );
+      return;
+    }
+    focusState = {
+      threadId: interaction.channelId,
+      chatId: resolved.chatId,
+      sessionId: resolved.sessionId,
+      title: resolved.title,
+      messageCount: resolved.messageCount,
+      // First focus captures the true default so A->B switches keep it.
+      defaultSessionId: focusState?.defaultSessionId ?? conn?.sessionId ?? null,
+      focusedAt: new Date().toISOString(),
+    };
+    await saveFocus(cfg.focusStateFile, focusState);
+    if (conn) await conn.rebind(resolved.sessionId, { pinned: true });
+    const title = resolved.title ?? resolved.sessionId;
+    const msgs = resolved.messageCount != null ? ` (${resolved.messageCount} messages)` : "";
+    await interaction.editReply(
+      conn?.desired
+        ? `Focused: voice now continues **${title}**${msgs}. Mirror posts here.`
+        : `Focused: the next voice call will continue **${title}**${msgs}. Mirror will post here.`,
+    );
+  }
+
+  async function handleUnfocus(interaction) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    if (!focusState) {
+      await interaction.editReply("Not focused.");
+      return;
+    }
+    const defaultSessionId = focusState.defaultSessionId ?? null;
+    focusState = null;
+    await clearFocus(cfg.focusStateFile);
+    if (conn) await conn.rebind(defaultSessionId, { pinned: false });
+    await interaction.editReply("Unfocused — back to the default voice conversation.");
+  }
+
+  async function handleBrief(interaction) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    if (!conn?.connected) {
+      await interaction.editReply("Not on a call — the brief is sent when a voice session starts.");
+      return;
+    }
+    await maybeSendBrief(null, true);
+    await interaction.editReply("Brief re-sent.");
+  }
+
   client.on("interactionCreate", async (interaction) => {
     if (!interaction.isChatInputCommand() || interaction.guildId !== cfg.guildId) return;
     if (interaction.user.id !== cfg.userId) {
@@ -334,9 +484,14 @@ async function main() {
     try {
       if (interaction.commandName === "join") await handleJoin(interaction);
       else if (interaction.commandName === "leave") await handleLeave(interaction);
+      else if (interaction.commandName === "focus") await handleFocus(interaction);
+      else if (interaction.commandName === "unfocus") await handleUnfocus(interaction);
+      else if (interaction.commandName === "brief") await handleBrief(interaction);
     } catch (err) {
       log(`command ${interaction.commandName} failed: ${err.message}`);
-      if (!interaction.replied) {
+      if (interaction.deferred && !interaction.replied) {
+        await interaction.editReply("That failed; check the logs.").catch(() => {});
+      } else if (!interaction.replied) {
         await interaction
           .reply({ content: "That failed; check the logs.", flags: MessageFlags.Ephemeral })
           .catch(() => {});
@@ -349,6 +504,15 @@ async function main() {
     body: [
       new SlashCommandBuilder().setName("join").setDescription("Join your voice channel and listen"),
       new SlashCommandBuilder().setName("leave").setDescription("Leave the voice channel"),
+      new SlashCommandBuilder()
+        .setName("focus")
+        .setDescription("Bind the voice call to this thread's Hermes conversation"),
+      new SlashCommandBuilder()
+        .setName("unfocus")
+        .setDescription("Return the voice call to its default conversation"),
+      new SlashCommandBuilder()
+        .setName("brief")
+        .setDescription("Re-send Monte's status brief to the voice session"),
     ].map((c) => c.toJSON()),
   });
   log("slash commands registered");

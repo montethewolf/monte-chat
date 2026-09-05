@@ -23,7 +23,15 @@ Discord playback (barge-in cuts ≤200ms, truncation ledger keeps history honest
 - `src/bridge.js` — both audio directions, playback queue + played-ms ledger,
   barge-in with clamped `conversation.item.truncate`, task/transcript mirroring.
 - `src/resample.js` — stateful 31-tap Kaiser (β=3.5) halfband, 2:1 both ways.
-- `src/index.js` — Discord client, `/join` `/leave`, player loop, `--loopback`.
+- `src/index.js` — Discord client, `/join` `/leave` `/focus` `/unfocus`
+  `/brief`, player loop, `--loopback`.
+- `src/hermes-status.js` — read-only views of Hermes state (`state.db`,
+  `kanban.db`, cron, `gateway_state.json`) for the brief and `/focus`
+  thread→session resolution. Best-effort by design: failures degrade to
+  omission, never into the call path.
+- `src/brief.js` — pure assembly of the bounded call-start brief; `chunkText`.
+- `src/focus.js` — `/focus` state persistence (its own file, so hlv-conn's
+  `state.json` rewrites can't clobber it).
 - `test/fake-gateway.js` — protocol-v6 fake; every frame self-validated with
   the SDK's `validateServerMessage`.
 
@@ -54,6 +62,30 @@ even from a locked phone. Speaking over the agent interrupts it. `/join` and
 `/leave` remain as manual overrides; `/leave` keeps the bot away until you
 `/join` again or start a fresh voice session. Background tasks keep running
 server-side and the conversation resumes on the next join.
+
+## Brief & focus
+
+When a voice session starts, the bridge injects a compact **system brief**
+(gateway/platform state, kanban, recent cron results, background work, recent
+Discord thread titles) as a text turn; the agent absorbs it and answers with
+just "Ready." — that spoken ack is the signal the brief landed. `/brief`
+re-sends it mid-call; `BRIEF_ENABLED=0` disables it. The brief is an index,
+not a database: anything deeper the voice model fetches from Hermes on demand.
+
+**`/focus`** (typed *inside* a Discord thread) binds the voice call to that
+thread's Hermes session: the HLV leg re-handshakes onto it (~1–3 s of quiet;
+Discord voice stays up), the agent speaks "Focused on <title>.", the whole
+thread history backs every answer (Hermes loads it server-side), voice turns
+append to the thread's session, and the text mirror posts into the thread.
+`/unfocus` returns to the default conversation. Focus survives service
+restarts, and a focus that can't be resumed is dropped *loudly* (a Discord
+notice), never silently. If the thread has no Hermes session yet, send Monte
+a message there first.
+
+Caveats: background tasks run in fresh sessions and don't inherit the focused
+thread (the brief tells the model to pass key facts via `recent_voice_context`),
+and HLV's long-term memory scope stays its own (`X-Hermes-Session-Key` is not
+per-thread) — the transcript, which is what matters, is the thread's.
 
 ## Notes
 
