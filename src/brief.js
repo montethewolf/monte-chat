@@ -67,7 +67,7 @@ function backgroundLine(work) {
   if (work.delegations > 0) parts.push(`${work.delegations} delegation${work.delegations > 1 ? "s" : ""} running`);
   if (work.activeTurns > 0) parts.push(`${work.activeTurns} chat turn${work.activeTurns > 1 ? "s" : ""} in flight`);
   if (work.pendingDeliveries > 0) parts.push(`${work.pendingDeliveries} deliveries pending`);
-  if (parts.length === 0) return "Background: quiet.";
+  if (parts.length === 0) return Object.values(work).some((v) => v == null) ? "Background: status unavailable." : "Background: quiet.";
   return `Background: ${parts.join(", ")}.`;
 }
 

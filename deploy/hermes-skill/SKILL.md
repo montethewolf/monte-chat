@@ -11,13 +11,13 @@ The bridge can mirror the call's transcripts into the Discord text channel.
 
 ## Transcript mirroring
 
-Three modes:
+Post voice conversation to text with two settings:
 
-- `on` — every final transcript line is posted to Discord (noisy; Alex
-  usually doesn't want this for long).
-- `off` — nothing is posted.
-- `auto` (default) — only permission/approval exchanges are posted, so the
-  approve-from-text workflow has context without a full call log.
+- `on` — post Alex's words, your replies, and task results to the selected
+  Discord channel or focused thread.
+- `off` (default) — transcripts and task-result content are suppressed; operational
+  notices (connection failures, recovery, and mode changes) still post.
+  Content already handed to Discord cannot be recalled.
 
 Control it with the CLI (applies immediately, mid-call, no restart):
 
@@ -25,17 +25,18 @@ Control it with the CLI (applies immediately, mid-call, no restart):
 /home/alex/.npm-global/bin/hlv-discord-ctl mirror status   # show current mode
 /home/alex/.npm-global/bin/hlv-discord-ctl mirror on
 /home/alex/.npm-global/bin/hlv-discord-ctl mirror off
-/home/alex/.npm-global/bin/hlv-discord-ctl mirror auto
 ```
 
 (`hlv-discord-ctl` is also on PATH.) When the user says things like "stop
-mirroring", "mirror this call", "turn the transcript log back to automatic" —
+mirroring", "mirror this call", "turn text posts off" —
 run the matching command and confirm with its one-line output. The bridge
 posts a status line to the Discord channel when the mode changes, so don't
 post an extra announcement yourself.
 
 ## Notes
 
+- Mirroring affects Discord text posts only, not Hermes memory or background tasks.
+- Legacy `auto` settings are interpreted as `off`; use only `on` and `off`.
 - The mode persists in `~/.local/state/hlv-discord/mirror.json` and survives
   service restarts. `MIRROR_TRANSCRIPTS` in `~/.config/hlv-discord/env` is
   only the first-boot default.

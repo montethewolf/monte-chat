@@ -87,6 +87,7 @@ export class FakeGateway {
 
   #onSessionStart(ws, msg) {
     this.starts.push(msg);
+    if (this.behavior.holdStart) return;
     const conv = msg.conversation ?? { mode: "unbound" };
     if (this.behavior.fatalStart) {
       this.send(ws, {

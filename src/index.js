@@ -5,7 +5,6 @@
 import { EventEmitter } from "node:events";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { Readable } from "node:stream";
 import {
   Client,
   GatewayIntentBits,
@@ -15,13 +14,10 @@ import {
   SlashCommandBuilder,
 } from "discord.js";
 import {
-  AudioPlayerStatus,
   EndBehaviorType,
   NoSubscriberBehavior,
-  StreamType,
   VoiceConnectionStatus,
   createAudioPlayer,
-  createAudioResource,
   entersState,
   generateDependencyReport,
   joinVoiceChannel,
@@ -30,19 +26,14 @@ import mediaplex from "mediaplex";
 import { HlvConnection } from "./hlv-conn.js";
 import { Bridge } from "./bridge.js";
 import { Decimator, Interpolator, monoToStereo, stereoToMono } from "./resample.js";
-import { buildBrief, chunkText } from "./brief.js";
-import {
-  listRecentDiscordThreads,
-  readActiveWork,
-  readCron,
-  readGatewayState,
-  readKanban,
-  resolveThreadSession,
-} from "./hermes-status.js";
-import { clearFocus, loadFocus, saveFocus } from "./focus.js";
+import { BriefSender } from "./brief-sender.js";
+import { watchMirrorMode } from "./mirror-watch.js";
+import { Playback } from "./playback.js";
+import { SessionStore } from "./session-store.js";
+import { StatusReader } from "./status-reader.js";
+import { DeliveryQueue } from "./delivery.js";
+import { CallController } from "./call-controller.js";
 import { MirrorFilter, loadMirrorMode, normalizeMirrorMode, saveMirrorMode } from "./mirror.js";
-import { watch } from "node:fs";
-import { basename, dirname } from "node:path";
 
 const { OpusEncoder } = mediaplex;
 
@@ -67,7 +58,7 @@ function readConfig() {
       process.env.HLV_STATE_FILE ?? join(homedir(), ".local", "state", "hlv-discord", "state.json"),
     silenceMs: Number(process.env.DISCORD_SILENCE_MS ?? 500),
     endPadMs: Number(process.env.HLV_END_PAD_MS ?? 240),
-    mirrorDefault: normalizeMirrorMode(process.env.MIRROR_TRANSCRIPTS, "auto"),
+    mirrorDefault: normalizeMirrorMode(process.env.MIRROR_TRANSCRIPTS),
     mirrorStateFile:
       process.env.MIRROR_STATE_FILE ??
       join(homedir(), ".local", "state", "hlv-discord", "mirror.json"),
@@ -110,6 +101,7 @@ class LoopbackBridge extends EventEmitter {
   }
 
   clearMicPause() {}
+  reset() { this.#queue = []; this.#utteranceActive = false; this.emit("player-stop"); }
   onSpeakingStart() {}
 
   beginUtterance() {
@@ -160,9 +152,11 @@ class LoopbackBridge extends EventEmitter {
 async function main() {
   const cfg = readConfig();
   const paths = hermesPaths(cfg);
-  let focusState = await loadFocus(cfg.focusStateFile);
+  const store = new SessionStore(cfg.stateFile, cfg.focusStateFile);
+  await store.load();
+  const status = new StatusReader({ paths, hlvUrl: cfg.hlvUrl, hlvToken: cfg.hlvToken, log });
   const mirror = new MirrorFilter((await loadMirrorMode(cfg.mirrorStateFile)) ?? cfg.mirrorDefault);
-  if (focusState) log(`focus restored: thread ${focusState.threadId} ("${focusState.title ?? "?"}")`);
+  if (store.value.focus) log("saved thread focus restored");
 
   // Boot check: DAVE (Discord E2EE) native binding must load, or every voice
   // join will fail as an opaque rejoin loop.
@@ -185,24 +179,26 @@ async function main() {
     conn = new HlvConnection({
       url: cfg.hlvUrl,
       token: cfg.hlvToken,
-      stateFile: cfg.stateFile,
-      pinnedSessionId: focusState?.sessionId ?? null,
+      sessionId: store.value.focus?.sessionId ?? store.value.defaultSessionId,
       log,
     });
     bridge = new Bridge({ conn, endPadMs: cfg.endPadMs, log });
     conn.on("ready", (ready) => {
       log("HLV session ready");
-      maybeSendBrief(ready).catch((err) => log(`brief failed: ${err.message}`));
+      briefSender.send(ready).catch(() => log("brief unavailable"));
     });
-    conn.on("resume-fallback", ({ sessionId }) => {
-      onFocusLost(sessionId).catch((err) => log(`focus-lost handling failed: ${err.message}`));
+    let resumeNoticeSent = false;
+    conn.on("attempt-failed", () => {
+      if (!resumeNoticeSent) postText("Voice reconnecting; saved conversation preserved. Use /new-conversation only to start fresh.");
+      resumeNoticeSent = true;
     });
+    conn.on("ready", () => { resumeNoticeSent = false; });
     conn.on("backoff", ({ delayMs, failures }) =>
       log(`HLV reconnect in ${delayMs}ms (failure #${failures})`),
     );
     conn.on("halted", ({ reason }) => {
       log(`HLV connection halted: ${reason}`);
-      postText(`Voice bridge halted: ${reason}. Restart the service to retry.`);
+      postText("Voice bridge halted; saved conversation preserved. Check service logs, or use /new-conversation to start fresh.");
     });
   }
 
@@ -213,200 +209,112 @@ async function main() {
   const player = createAudioPlayer({
     behaviors: { noSubscriber: NoSubscriberBehavior.Pause, maxMissedFrames: 5 },
   });
-  player.on("error", (err) => log(`player error: ${err.message}`));
+  const playback = new Playback({ bridge, player, log });
 
-  let voice = null; // active VoiceConnection
   let boundChannelId = cfg.textChannelId; // text channel for mirrored messages
   let autoFollow = true; // /leave suppresses following until /join or a fresh session
 
-  // Mirror target: the focused thread when focus is set, else the bound channel.
-  async function postText(text) {
-    const target = focusState?.threadId ?? boundChannelId;
-    if (!target) return;
-    try {
+  const controller = new CallController({
+    conn, bridge, playback, store, status, attachVoice, notice: (text) => postText(text), log,
+  });
+  const delivery = new DeliveryQueue({
+    mode: () => mirror.mode, log,
+    send: async (target, message) => {
       const channel = await client.channels.fetch(target);
-      for (const part of chunkText(text)) await channel.send(part);
-    } catch (err) {
-      log(`text mirror failed: ${err.message}`);
-    }
+      if (typeof channel?.send !== "function") throw Object.assign(new Error("Unavailable text destination"), { status: 404 });
+      await channel.send(message);
+    },
+  });
+  function mirrorTarget() {
+    return controller.focusState?.threadId ?? boundChannelId ?? controller.desiredChannel?.id;
+  }
+  function postText(text, options = {}) {
+    delivery.enqueue({ text, target: mirrorTarget(), ...options });
   }
 
-  // --- call-start brief -----------------------------------------------------
+  const briefSender = new BriefSender({ conn, controller, status, enabled: cfg.briefEnabled,
+    ttlMs: cfg.briefTtlMin * 60_000, maxChars: cfg.briefMaxChars, log });
 
-  let lastBriefedSessionId = null;
-  let lastBriefAt = 0;
-
-  async function gatherBriefData() {
-    const threads = await listRecentDiscordThreads({
-      hlvUrl: cfg.hlvUrl,
-      hlvToken: cfg.hlvToken,
-      stateDbPath: paths.stateDb,
-    });
-    return {
-      now: new Date(),
-      gateway: readGatewayState(paths.gatewayState),
-      kanban: readKanban(paths.kanbanDb),
-      cron: readCron(paths.cronDb, paths.cronJobs),
-      activeWork: readActiveWork(paths.stateDb),
-      threads,
-      focus: focusState
-        ? { title: focusState.title, messageCount: focusState.messageCount ?? null }
-        : null,
-      maxChars: cfg.briefMaxChars,
-    };
-  }
-
-  async function maybeSendBrief(ready, force = false) {
-    if (!cfg.briefEnabled || !conn) return;
-    const sid = ready?.conversation?.sessionId ?? conn.sessionId ?? null;
-    if (
-      !force &&
-      sid &&
-      sid === lastBriefedSessionId &&
-      Date.now() - lastBriefAt < cfg.briefTtlMin * 60_000
-    ) {
-      return; // transient reconnect on the same session: don't re-bill/re-speak
-    }
-    const brief = buildBrief(await gatherBriefData());
-    if (conn.sendText(brief) === undefined) return; // not connected; next ready retries
-    lastBriefedSessionId = sid;
-    lastBriefAt = Date.now();
-    log(`brief sent (${brief.length} chars${focusState ? ", focused" : ""})`);
-  }
-
-  async function onFocusLost(sessionId) {
-    if (!focusState || focusState.sessionId !== sessionId) return;
-    focusState = null;
-    await clearFocus(cfg.focusStateFile);
-    await postText(
-      "Focus lost: couldn't resume that thread's session; started a fresh voice conversation.",
-    );
-  }
-
-  bridge.on("text", ({ kind, speaker, text }) => {
+  bridge.on("text", ({ kind, speaker, text, key }) => {
     if (kind === "transcript") {
-      for (const line of mirror.decide(speaker, text)) postText(line);
+      for (const line of mirror.decide(speaker, text)) postText(line, { kind: "transcript" });
       return;
     }
-    postText(`**${kind}**: ${text}`);
+    const sensitive = kind === "task" || kind === "notification";
+    postText(`**${kind}**: ${text}`, { kind: sensitive ? "content" : "operational", key });
   });
 
-  // The mirror state file is the control surface: hlv-discord-ctl (run by
-  // Hermes on a spoken "stop mirroring", or by hand) rewrites it, and this
-  // watcher applies the change mid-call. Watch the directory — the file is
-  // replaced by atomic rename, which would orphan a file-level watcher.
-  {
-    const dir = dirname(cfg.mirrorStateFile);
-    const file = basename(cfg.mirrorStateFile);
-    let reloadTimer = null;
-    try {
-      watch(dir, (eventType, filename) => {
-        if (filename && filename !== file) return;
-        clearTimeout(reloadTimer);
-        reloadTimer = setTimeout(async () => {
-          const mode = await loadMirrorMode(cfg.mirrorStateFile);
-          if (mode === null || mode === mirror.mode) return;
-          mirror.setMode(mode);
-          log(`mirror mode -> ${mode} (state file)`);
-          postText(`**status**: transcript mirroring ${mode}`);
-        }, 150);
-      });
-    } catch (err) {
-      log(`mirror state watch failed (${err.message}); /mirror still works`);
-    }
-  }
+  const mirrorWatcher = await watchMirrorMode(cfg.mirrorStateFile, (mode) => {
+    if (mode === mirror.mode) return;
+    mirror.setMode(mode);
+    delivery.policyChanged();
+    postText(`**status**: voice conversation to text ${mode}`);
+  }, { log }).catch(() => { log("mirror watcher unavailable; /mirror still works"); return null; });
 
-  // Player runs only while the bridge has something to say; when nextPacket()
-  // returns null the resource ends, the player idles, and the ring goes dark.
-  bridge.on("player-run", () => {
-    if (player.state.status !== AudioPlayerStatus.Idle) return;
-    const stream = new Readable({
-      objectMode: true,
-      read() {
-        this.push(bridge.nextPacket());
-      },
+  async function attachVoice(channel, signal, onLost) {
+    const connection = joinVoiceChannel({
+      channelId: channel.id, guildId: channel.guild.id,
+      adapterCreator: channel.guild.voiceAdapterCreator, selfDeaf: false,
     });
-    player.play(createAudioResource(stream, { inputType: StreamType.Opus }));
-  });
-  bridge.on("player-stop", () => {
-    if (player.state.status !== AudioPlayerStatus.Idle) player.stop(true);
-  });
-
-  function wireReceiver(connection) {
-    const receiver = connection.receiver;
-    receiver.speaking.on("start", (userId) => {
-      if (userId !== cfg.userId) return;
-      bridge.onSpeakingStart();
+    const abortJoin = () => { if (connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy(); };
+    signal.addEventListener("abort", abortJoin, { once: true });
+    let active = null;
+    const cleanup = () => {
+      const current = active;
+      active = null;
+      current?.sink.abort();
+      current?.stream.destroy();
+    };
+    const receive = (userId) => {
+      if (userId !== cfg.userId || (conn && !conn.connected)) return;
       const sink = bridge.beginUtterance();
       if (!sink) return;
-      const stream = receiver.subscribe(userId, {
+      const stream = connection.receiver.subscribe(userId, {
         end: { behavior: EndBehaviorType.AfterSilence, duration: cfg.silenceMs },
       });
+      const capture = active = { sink, stream };
       stream.on("data", (packet) => sink.write(packet));
-      stream.once("end", () => sink.end());
-      stream.on("error", (err) => {
-        log(`receive stream error: ${err.message}`);
-        sink.abort();
+      stream.once("end", () => { if (active === capture) { active = null; sink.end(); } });
+      stream.once("close", () => { if (active === capture) { active = null; sink.abort(); } });
+      stream.on("error", () => {
+        if (active !== capture) return;
+        cleanup(); log("voice receive stream failed; reconnecting input");
+        // A partial upstream utterance has no clear-buffer API; detach it
+        // before accepting another one so unrelated speech is never combined.
+        if (controller.voice === connection) {
+          controller.recoverVoice(connection, (recoverySignal) =>
+            entersState(connection, VoiceConnectionStatus.Ready, recoverySignal)).catch(() => {});
+        }
       });
+    };
+    connection.receiver.speaking.on("start", receive);
+    connection.once(VoiceConnectionStatus.Destroyed, () => {
+      cleanup(); connection.receiver.speaking.off("start", receive);
     });
-  }
-
-  function watchConnection(connection) {
-    const connectingTimes = [];
-    connection.on("stateChange", (_oldState, newState) => {
-      if (newState.status !== VoiceConnectionStatus.Connecting) return;
-      const now = Date.now();
-      connectingTimes.push(now);
-      while (connectingTimes.length > 0 && connectingTimes[0] < now - 30_000) {
-        connectingTimes.shift();
-      }
-      if (connectingTimes.length === 4) {
-        // A DAVE/E2EE failure (close 4017) presents as an endless rejoin loop.
-        log("voice connection is cycling — possible DAVE/E2EE failure");
-        log(generateDependencyReport());
-        postText("Voice connection is cycling; possible E2EE dependency problem. Check the logs.");
-      }
+    const inputError = () => active?.stream.destroy(new Error("speech detector failed"));
+    bridge.on("input-error", inputError);
+    connection.once(VoiceConnectionStatus.Destroyed, () => bridge.off("input-error", inputError));
+    connection.on("stateChange", (old, next) => {
+      if (old.status !== next.status) bridge.diagnostic?.("discord_state", { from: old.status, to: next.status });
     });
-    connection.on(VoiceConnectionStatus.Disconnected, async () => {
-      try {
-        await Promise.race([
-          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-          entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-        ]);
-        log("voice reconnecting");
-      } catch {
-        log("voice connection lost");
-        if (voice === connection) voice = null;
-        connection.destroy();
+    connection.on("error", () => log("Discord voice connection error"));
+    connection.on(VoiceConnectionStatus.Disconnected, () => {
+      if (controller.voice === connection) {
+        controller.recoverVoice(connection, (recoverySignal) =>
+          entersState(connection, VoiceConnectionStatus.Ready, recoverySignal)).catch(() => {});
       }
     });
-    connection.on("error", (err) => log(`voice error: ${err.message}`));
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+      signal.throwIfAborted();
+      connection.subscribe(player);
+      return { voice: connection, cleanup };
+    } catch (err) { cleanup(); abortJoin(); throw err; }
+    finally { signal.removeEventListener("abort", abortJoin); }
   }
 
-  async function joinChannel(channel) {
-    voice?.destroy();
-    voice = joinVoiceChannel({
-      channelId: channel.id,
-      guildId: channel.guild.id,
-      adapterCreator: channel.guild.voiceAdapterCreator,
-      selfDeaf: false,
-    });
-    watchConnection(voice);
-    wireReceiver(voice);
-    voice.subscribe(player);
-    bridge.clearMicPause();
-    if (conn) await conn.start();
-    log(`joined voice channel ${channel.id}`);
-  }
-
-  async function leaveVoice(reason) {
-    if (voice) {
-      voice.destroy();
-      voice = null;
-      log("left voice channel");
-    }
-    if (conn) await conn.stop(reason); // keeps sessionId for later resume
-  }
+  async function joinChannel(channel) { await controller.join(channel); }
+  async function leaveVoice(reason) { await controller.leave(reason); }
 
   // Follow the allowed user's voice presence: join when they join, move when
   // they move, leave when they leave. Slash commands remain manual overrides.
@@ -416,7 +324,7 @@ async function main() {
     try {
       if (newState.channel) {
         if (!autoFollow) return;
-        if (voice && voice.joinConfig.channelId === newState.channel.id) return; // mute/deafen churn
+        if (controller.voice && controller.voice.joinConfig.channelId === newState.channel.id) return; // mute/deafen churn
         log("following user into voice");
         await joinChannel(newState.channel);
       } else if (oldState.channelId) {
@@ -437,19 +345,18 @@ async function main() {
       });
       return;
     }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     autoFollow = true;
     boundChannelId = interaction.channelId;
     await joinChannel(channel);
-    await interaction.reply({
-      content: cfg.loopback ? "Joined in loopback mode — speak and I echo." : "Listening.",
-      flags: MessageFlags.Ephemeral,
-    });
+    await interaction.editReply(cfg.loopback ? "Joined in loopback mode — speak and I echo." : "Listening.");
   }
 
   async function handleLeave(interaction) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     autoFollow = false; // stay away until /join or the user re-enters voice fresh
     await leaveVoice("user dismissed the bridge");
-    await interaction.reply({ content: "Left.", flags: MessageFlags.Ephemeral });
+    await interaction.editReply("Left.");
   }
 
   async function handleFocus(interaction) {
@@ -459,45 +366,25 @@ async function main() {
       await interaction.editReply("Run /focus inside a thread.");
       return;
     }
-    const resolved = resolveThreadSession(paths.stateDb, interaction.channelId);
-    if (!resolved) {
-      await interaction.editReply(
-        "No Hermes session exists for this thread yet — send Monte a message here first, then /focus. (Or the state DB was busy; try again.)",
-      );
-      return;
-    }
-    focusState = {
-      threadId: interaction.channelId,
-      chatId: resolved.chatId,
-      sessionId: resolved.sessionId,
-      title: resolved.title,
-      messageCount: resolved.messageCount,
-      // First focus captures the true default so A->B switches keep it.
-      defaultSessionId: focusState?.defaultSessionId ?? conn?.sessionId ?? null,
-      focusedAt: new Date().toISOString(),
-    };
-    await saveFocus(cfg.focusStateFile, focusState);
-    if (conn) await conn.rebind(resolved.sessionId, { pinned: true });
-    const title = resolved.title ?? resolved.sessionId;
-    const msgs = resolved.messageCount != null ? ` (${resolved.messageCount} messages)` : "";
-    await interaction.editReply(
-      conn?.desired
-        ? `Focused: voice now continues **${title}**${msgs}. Mirror posts here.`
-        : `Focused: the next voice call will continue **${title}**${msgs}. Mirror will post here.`,
-    );
+    await controller.focus(interaction.channelId);
+    const focus = controller.focusState;
+    await interaction.editReply(controller.ready
+      ? `Focused: voice continues **${focus.title ?? "this thread"}**. Mirror posts here.`
+      : "Focused: the next voice call will continue this thread. Mirror will post here.");
   }
 
   async function handleUnfocus(interaction) {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    if (!focusState) {
-      await interaction.editReply("Not focused.");
-      return;
-    }
-    const defaultSessionId = focusState.defaultSessionId ?? null;
-    focusState = null;
-    await clearFocus(cfg.focusStateFile);
-    if (conn) await conn.rebind(defaultSessionId, { pinned: false });
-    await interaction.editReply("Unfocused — back to the default voice conversation.");
+    if (!controller.focusState) { await interaction.editReply("Not focused."); return; }
+    await controller.unfocus();
+    await interaction.editReply("Unfocused — default voice conversation selected.");
+  }
+
+  async function handleNewConversation(interaction) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    await controller.newConversation();
+    await interaction.editReply(controller.ready ? "Started a fresh voice conversation; focus cleared. Background tasks continue."
+      : "The next voice call will start fresh; focus cleared. Background tasks continue.");
   }
 
   async function handleBrief(interaction) {
@@ -506,25 +393,24 @@ async function main() {
       await interaction.editReply("Not on a call — the brief is sent when a voice session starts.");
       return;
     }
-    await maybeSendBrief(null, true);
-    await interaction.editReply("Brief re-sent.");
+    const sent = await briefSender.send(null, true);
+    await interaction.editReply(sent ? "Brief re-sent." : "Brief not sent: disabled or call changed.");
   }
 
   async function handleMirror(interaction) {
     const requested = interaction.options.getString("mode");
     if (!requested) {
       await interaction.reply({
-        content: `Transcript mirroring is **${mirror.mode}**.`,
+        content: `Post voice conversation to text: **${mirror.mode}**. Off still allows connection/status notices. Undelivered notices this run: ${delivery.failures}.`,
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const mode = mirror.setMode(requested);
+    delivery.policyChanged();
     await saveMirrorMode(cfg.mirrorStateFile, mode);
-    await interaction.reply({
-      content: `Transcript mirroring **${mode}**.`,
-      flags: MessageFlags.Ephemeral,
-    });
+    await interaction.editReply(`Post voice conversation to text: **${mode}**. ${mode === "on" ? "Your words, replies, and task results will post to the selected channel." : "Only connection/status notices will post."}`);
   }
 
   client.on("interactionCreate", async (interaction) => {
@@ -539,6 +425,7 @@ async function main() {
       else if (interaction.commandName === "focus") await handleFocus(interaction);
       else if (interaction.commandName === "unfocus") await handleUnfocus(interaction);
       else if (interaction.commandName === "brief") await handleBrief(interaction);
+      else if (interaction.commandName === "new-conversation") await handleNewConversation(interaction);
       else if (interaction.commandName === "mirror") await handleMirror(interaction);
     } catch (err) {
       log(`command ${interaction.commandName} failed: ${err.message}`);
@@ -557,6 +444,7 @@ async function main() {
     body: [
       new SlashCommandBuilder().setName("join").setDescription("Join your voice channel and listen"),
       new SlashCommandBuilder().setName("leave").setDescription("Leave the voice channel"),
+      new SlashCommandBuilder().setName("new-conversation").setDescription("Explicitly start fresh and clear focus; background tasks continue"),
       new SlashCommandBuilder()
         .setName("focus")
         .setDescription("Bind the voice call to this thread's Hermes conversation"),
@@ -568,15 +456,14 @@ async function main() {
         .setDescription("Re-send Monte's status brief to the voice session"),
       new SlashCommandBuilder()
         .setName("mirror")
-        .setDescription("Voice transcript mirroring (no mode: show current)")
+        .setDescription("Post voice conversation to text (no mode: show current)")
         .addStringOption((o) =>
           o
             .setName("mode")
-            .setDescription("on = everything, off = nothing, auto = permission events only")
+            .setDescription("On: conversation and task results. Off: connection/status notices only.")
             .addChoices(
               { name: "on", value: "on" },
               { name: "off", value: "off" },
-              { name: "auto", value: "auto" },
             ),
         ),
     ].map((c) => c.toJSON()),
@@ -600,8 +487,9 @@ async function main() {
 
   async function shutdown(signal) {
     log(`${signal} received; shutting down`);
-    voice?.destroy();
-    if (conn) await conn.stop("service shutdown").catch(() => {});
+    mirrorWatcher?.close();
+    delivery.close();
+    await controller.close().catch(() => {});
     await client.destroy().catch(() => {});
     process.exit(0);
   }

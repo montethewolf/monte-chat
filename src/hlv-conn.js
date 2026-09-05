@@ -1,396 +1,256 @@
-// HLV connection wrapper: owns reconnection, liveness, and session persistence
-// around the official hermes-live-voice browser SDK. The SDK itself never
-// reconnects and never pings; both are this wrapper's job.
-//
-// States: idle -> connecting -> ready -> backoff -> connecting ... ; terminal: halted.
-// Never log tokens or socket URLs.
-
+// Gateway transport only. The call controller owns conversation persistence.
 import { EventEmitter } from "node:events";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
 import WebSocket from "ws";
 import { HermesLiveClient } from "hermes-live-voice/browser";
 
-// Server messages the bridge consumes, re-emitted verbatim so consumers can
-// subscribe once to the wrapper instead of re-attaching per reconnect.
-const RE_EMITTED = [
-  "audio.output",
-  "transcript.delta",
-  "input.speech_started",
-  "input.pause_requested",
-  "response.started",
-  "response.completed",
-  "response.cancelled",
-  "response.failed",
-  "task.notification",
-  "task.updated",
-  "audio.dropped",
-];
-
-function findSessionIds(value, out) {
-  if (Array.isArray(value)) {
-    for (const item of value) findSessionIds(item, out);
-  } else if (value && typeof value === "object") {
-    for (const [key, item] of Object.entries(value)) {
-      if ((key === "sessionId" || key === "id") && typeof item === "string") out.add(item);
-      else findSessionIds(item, out);
-    }
-  }
-}
+const EVENTS = ["audio.output", "transcript.delta", "input.speech_started", "input.pause_requested",
+  "response.started", "response.completed", "response.cancelled", "response.failed",
+  "task.notification", "task.updated", "audio.dropped"];
 
 export class HlvConnection extends EventEmitter {
-  #forceNew = false;
-  #attemptedResume = false;
-  #resumeFallbackUsed = false;
-  #lastSessionError = null;
-  #retryAfterFloorMs = 0;
+  #generation = 0;
+  #abort = null;
+  #socket = null;
+  #retry = null;
+  #ping = null;
+  #pong = null;
   #failures = 0;
-  #reconnectTimer = null;
-  #pingTimer = null;
-  #pongTimer = null;
-  #rawSocket = null;
+  #retryAfter = 0;
+  #error = null;
 
   constructor(options) {
     super();
     if (!options?.url) throw new Error("HlvConnection requires a gateway url");
-    this.url = String(options.url);
-    this.token = options.token ?? null;
-    this.stateFile = options.stateFile ?? null;
-    this.pingIntervalMs = options.pingIntervalMs ?? 15_000;
-    this.pongTimeoutMs = options.pongTimeoutMs ?? 10_000;
-    this.backoffBaseMs = options.backoffBaseMs ?? 1_000;
-    this.backoffMaxMs = options.backoffMaxMs ?? 30_000;
-    this.jitterMs = options.jitterMs ?? 250;
-    this.log = options.log ?? (() => {});
-    this.state = "idle";
-    this.desired = false;
-    this.client = null;
-    this.sessionId = null;
-    // A pinned session skips the listing pre-validation in #chooseConversation:
-    // the gateway's /v1/conversations tops out at 100 rows dominated by cron
-    // sessions, so a deliberately-focused Discord session would be "not found"
-    // there and silently downgraded to mode:"new".
-    this.pinnedSessionId = options.pinnedSessionId ?? null;
+    Object.assign(this, {
+      url: String(options.url), token: options.token ?? null,
+      sessionId: options.sessionId ?? null, pinnedSessionId: options.pinnedSessionId ?? null,
+      log: options.log ?? (() => {}),
+      pingIntervalMs: options.pingIntervalMs ?? 15_000, pongTimeoutMs: options.pongTimeoutMs ?? 10_000,
+      backoffBaseMs: options.backoffBaseMs ?? 1000, backoffMaxMs: options.backoffMaxMs ?? 30_000,
+      jitterMs: options.jitterMs ?? 250, connectTimeoutMs: options.connectTimeoutMs ?? 10_000,
+      disconnectTimeoutMs: options.disconnectTimeoutMs ?? 2000,
+      prepareSession: options.prepareSession, commitSession: options.commitSession,
+      desired: false, state: "idle", client: null,
+    });
   }
 
-  get session() {
-    return this.client?.session;
-  }
-
-  get connected() {
-    return this.state === "ready" && Boolean(this.client?.connected);
-  }
-
-  async start() {
-    if (this.desired) return;
-    this.desired = true;
-    await this.#loadState();
-    this.#attempt();
-  }
-
-  async stop(reason = "bridge shutdown") {
-    this.desired = false;
-    clearTimeout(this.#reconnectTimer);
-    this.#reconnectTimer = null;
-    this.#stopPing();
-    const client = this.client;
-    this.client = null;
-    if (client) {
-      try {
-        await client.disconnect(reason);
-      } catch (err) {
-        this.log(`disconnect: ${err.message}`);
-      }
-    }
-    if (this.state !== "halted") this.#setState("idle");
-  }
-
-  // Point the wrapper at a different Hermes session without connecting:
-  // persists the id (so the next start() resumes it) and optionally pins it.
-  // sessionId=null forgets the pin and forces a fresh conversation next start.
-  async adoptSessionId(sessionId, { pinned = false } = {}) {
-    if (sessionId) {
-      this.pinnedSessionId = pinned ? sessionId : null;
-      await this.#saveSessionId(sessionId);
-    } else {
-      this.pinnedSessionId = null;
-      this.#forceNew = true;
-    }
-  }
-
-  // Swap the live session: stop the HLV client, adopt the target, reconnect.
-  // The caller's Discord voice connection is independent and stays up; only
-  // the HLV leg re-handshakes. When not started, this just persists the
-  // target so the next start() opens on it.
-  async rebind(sessionId, { pinned = false } = {}) {
-    const active = this.desired;
-    await this.stop("rebind");
-    await this.adoptSessionId(sessionId, { pinned });
-    if (active && this.state !== "halted") await this.start();
-  }
-
-  // --- passthroughs (safe while disconnected: drop and report undefined) ---
-
-  sendAudio(data, mimeType) {
-    if (!this.connected) return undefined;
-    return this.client.sendAudio(data, mimeType);
-  }
-
-  endAudio() {
-    if (!this.connected) return undefined;
-    return this.client.endAudio();
-  }
-
-  cancelResponse(reason, truncate) {
-    if (!this.connected) return undefined;
-    return this.client.cancelResponse(reason, truncate);
-  }
-
-  sendText(text) {
-    if (!this.connected) return undefined;
-    return this.client.sendText(text);
-  }
-
-  // --- connection lifecycle ---
-
-  #setState(state) {
-    if (state === this.state) return;
+  get generation() { return this.#generation; }
+  get session() { return this.client?.session; }
+  get connected() { return this.state === "ready" && Boolean(this.client?.connected); }
+  #state(state) {
+    if (this.state === state) return;
     const previous = this.state;
     this.state = state;
     this.emit("state", { state, previous });
   }
 
+  async start() {
+    if (this.desired || this.state === "halted") return;
+    this.desired = true;
+    this.#attempt();
+  }
+
+  async stop(reason = "bridge shutdown") {
+    this.desired = false;
+    const generation = ++this.#generation;
+    this.#abort?.abort();
+    clearTimeout(this.#retry);
+    this.#retry = null;
+    this.#stopPing();
+    const client = this.client;
+    const socket = this.#socket;
+    this.client = null;
+    this.#socket = null;
+    this.emit("disconnected", { reason });
+    if (this.state !== "halted") this.#state("idle");
+    let timer;
+    try {
+      if (client) await Promise.race([
+        client.disconnect(reason),
+        new Promise((resolve) => { timer = setTimeout(resolve, this.disconnectTimeoutMs); }),
+      ]);
+    } catch { this.log("gateway disconnect failed"); }
+    finally {
+      clearTimeout(timer);
+      if (socket && socket.readyState !== WebSocket.CLOSED) socket.terminate();
+    }
+    return generation;
+  }
+
+  async adoptSessionId(sessionId, { pinned = false } = {}) {
+    this.sessionId = sessionId ?? null;
+    this.pinnedSessionId = pinned ? sessionId : null;
+  }
+
+  async rebind(sessionId, options = {}) {
+    const active = this.desired;
+    const generation = await this.stop("rebind");
+    if (generation !== this.#generation) return;
+    await this.adoptSessionId(sessionId, options);
+    if (generation === this.#generation && active && this.state !== "halted") await this.start();
+  }
+
+  // Only explicit user recovery clears a nonrecoverable transport halt.
+  resetHalt() { if (this.state === "halted") this.#state("idle"); }
+
+  waitReady({ signal, timeoutMs = 12_000 } = {}) {
+    if (signal?.aborted) return Promise.reject(new Error("Call superseded"));
+    if (this.connected) return Promise.resolve(this.session);
+    return new Promise((resolve, reject) => {
+      const finish = (err, ready) => {
+        clearTimeout(timer);
+        this.off("ready", readyHandler); this.off("halted", halted);
+        this.off("disconnected", disconnected);
+        signal?.removeEventListener("abort", aborted);
+        err ? reject(err) : resolve(ready);
+      };
+      const readyHandler = (ready) => finish(null, ready);
+      const halted = () => finish(new Error("Gateway halted; saved conversation preserved"));
+      const disconnected = () => finish(new Error("Gateway disconnected"));
+      const aborted = () => finish(new Error("Call superseded"));
+      const timer = setTimeout(() => finish(new Error("Gateway is reconnecting; saved conversation preserved")), timeoutMs);
+      this.on("ready", readyHandler); this.on("halted", halted); this.on("disconnected", disconnected);
+      signal?.addEventListener("abort", aborted, { once: true });
+      if (this.state === "halted") halted();
+    });
+  }
+
+  sendAudio(data, mimeType) { return this.connected ? this.client.sendAudio(data, mimeType) : undefined; }
+  endAudio() { return this.connected ? this.client.endAudio() : undefined; }
+  cancelResponse(reason, truncate) { return this.connected ? this.client.cancelResponse(reason, truncate) : undefined; }
+  sendText(text) { return this.connected ? this.client.sendText(text) : undefined; }
+
   #attempt() {
     if (!this.desired || this.state === "halted") return;
-    this.#setState("connecting");
-    this.#run().catch((err) => this.#onAttemptFailed(err));
-  }
-
-  async #run() {
-    const conversation = await this.#chooseConversation();
-    this.#attemptedResume = conversation.mode === "resume";
-    this.#lastSessionError = null;
-    const client = this.#createClient();
-    this.client = client;
-    const ready = await client.connect({ conversation });
-    if (client !== this.client) return; // superseded while connecting
-    this.#failures = 0;
-    this.#retryAfterFloorMs = 0;
-    this.#resumeFallbackUsed = false;
-    const sid = ready.conversation?.sessionId;
-    if (sid) await this.#saveSessionId(sid);
-    this.#startPing();
-    this.#setState("ready");
-    this.emit("ready", ready);
-  }
-
-  #createClient() {
-    const client = new HermesLiveClient({
-      url: this.url,
-      webSocketFactory: (url) => this.#createSocket(url),
-    });
-    const current = () => client === this.client;
-    for (const type of RE_EMITTED) {
-      client.on(type, (event) => {
-        if (current()) this.emit(type, event);
-      });
-    }
-    client.on("error", (event) => {
-      if (current()) this.emit("client-error", event);
-    });
-    client.on("session.error", (event) => {
+    const generation = ++this.#generation;
+    this.#abort?.abort();
+    const abort = this.#abort = new AbortController();
+    const current = () => this.desired && generation === this.#generation && !abort.signal.aborted;
+    this.#error = null;
+    this.#state("connecting");
+    this.#run(abort.signal, current).catch((err) => {
       if (!current()) return;
-      this.#lastSessionError = event;
-      this.emit("session.error", event);
-      if (event.recoverable === false && this.state === "ready") {
-        this.#halt(`gateway reported a nonrecoverable error (${event.code})`);
+      this.#stopPing();
+      this.client = null;
+      this.#socket?.terminate();
+      this.#socket = null;
+      this.emit("disconnected", { reason: "attempt failed" });
+      if (this.#error?.recoverable === false) {
+        this.#halt(`gateway rejected the session (${this.#error.code})`);
+        return;
       }
+      this.log("gateway connection failed; preserving selected conversation");
+      this.emit("attempt-failed", { error: err, sessionId: this.sessionId });
+      this.#schedule();
+    });
+  }
+
+  async #run(signal, current) {
+    const target = this.prepareSession ? await this.prepareSession(signal) : this.sessionId;
+    if (!current()) return;
+    this.#error = null;
+    const conversation = target ? { mode: "resume", sessionId: target } : { mode: "new" };
+    const client = new HermesLiveClient({
+      url: this.url, connectTimeoutMs: this.connectTimeoutMs, disconnectTimeoutMs: this.disconnectTimeoutMs,
+      webSocketFactory: (url) => {
+        const socket = new WebSocket(url, { headers: this.token ? { Authorization: `Bearer ${this.token}` } : {} });
+        socket.on("unexpected-response", (_req, res) => {
+          if (current()) {
+            const seconds = Number(res.headers["retry-after"]);
+            if (Number.isFinite(seconds) && seconds > 0) this.#retryAfter = seconds * 1000;
+            this.log(`gateway refused connection (HTTP ${res.statusCode})`);
+          }
+          res.resume(); socket.terminate();
+        });
+        socket.on("pong", () => {
+          if (!current()) return;
+          clearTimeout(this.#pong); this.#pong = null;
+        });
+        this.#socket = socket;
+        return socket;
+      },
+    });
+    this.client = client;
+    const live = () => current() && client === this.client;
+    const pendingEvents = [];
+    let pendingBytes = 0;
+    let pendingOverflow = false;
+    for (const type of EVENTS) client.on(type, (event) => {
+      if (!live()) return;
+      if (this.state === "ready") this.emit(type, event);
+      else if (!pendingOverflow) {
+        pendingBytes += JSON.stringify(event).length;
+        if (pendingEvents.length >= 200 || pendingBytes > 2_000_000) pendingOverflow = true;
+        else pendingEvents.push([type, event]);
+      }
+    });
+    client.on("error", (event) => { if (live()) this.emit("client-error", event); });
+    client.on("session.error", (event) => {
+      if (!live()) return;
+      this.#error = event;
+      this.emit("session.error", event);
+      if (event.recoverable === false && this.state === "ready") this.#halt(`gateway reported error (${event.code})`);
     });
     client.on("close", (event) => {
-      if (!current()) return;
-      this.emit("close", event);
-      this.#onClose(event);
-    });
-    return client;
-  }
-
-  #createSocket(url) {
-    const headers = {};
-    if (this.token) headers.Authorization = `Bearer ${this.token}`;
-    const ws = new WebSocket(url, { headers });
-    ws.on("unexpected-response", (req, res) => {
-      const retryAfter = Number(res.headers["retry-after"]);
-      if (Number.isFinite(retryAfter) && retryAfter > 0) {
-        this.#retryAfterFloorMs = retryAfter * 1000;
+      if (!live() || this.state !== "ready") return;
+      this.#stopPing();
+      this.emit("disconnected", event);
+      if (event.code === 1008) this.#halt(`gateway closed connection (${event.code})`);
+      else {
+        this.client = null;
+        this.#schedule();
       }
-      this.log(`gateway refused the connection (HTTP ${res.statusCode})`);
-      res.resume();
-      ws.terminate();
     });
-    ws.on("pong", () => {
-      clearTimeout(this.#pongTimer);
-      this.#pongTimer = null;
-    });
-    this.#rawSocket = ws;
-    return ws;
-  }
-
-  async #chooseConversation() {
-    if (this.#forceNew) {
-      this.#forceNew = false;
-      return { mode: "new" };
-    }
-    if (this.pinnedSessionId && this.sessionId === this.pinnedSessionId) {
-      // Deliberate focus target: resume without listing pre-validation (see
-      // the constructor note). session_start_failed still falls back once.
-      return { mode: "resume", sessionId: this.sessionId };
-    }
-    if (this.sessionId && (await this.#conversationExists(this.sessionId))) {
-      return { mode: "resume", sessionId: this.sessionId };
-    }
-    return { mode: "new" };
-  }
-
-  // Pre-validate a saved sessionId against the gateway's persisted-session
-  // list; session_start_failed is ambiguous, so this avoids most bad resumes.
-  // On any listing failure we optimistically try the resume (the one-shot
-  // mode:"new" fallback covers a stale id).
-  async #conversationExists(sessionId) {
-    try {
-      const base = new URL(this.url);
-      const scheme = base.protocol === "wss:" ? "https" : "http";
-      const headers = {};
-      if (this.token) headers.Authorization = `Bearer ${this.token}`;
-      const res = await fetch(`${scheme}://${base.host}/v1/conversations?limit=100`, { headers });
-      if (!res.ok) return true;
-      const ids = new Set();
-      findSessionIds(await res.json(), ids);
-      return ids.has(sessionId);
-    } catch {
-      return true;
+    const ready = await client.connect({ conversation, signal });
+    if (!live()) return;
+    await this.commitSession?.(ready, signal);
+    if (!live()) return;
+    if (!client.connected) throw new Error("Gateway closed during readiness commit");
+    if (pendingOverflow) throw new Error("Gateway events exceeded startup buffer");
+    this.sessionId = ready.conversation?.sessionId ?? target;
+    this.#failures = 0;
+    this.#retryAfter = 0;
+    this.#state("ready");
+    this.#startPing(this.#socket);
+    this.emit("ready", ready);
+    for (const [type, event] of pendingEvents) {
+      if (!live()) break;
+      this.emit(type, event);
     }
   }
 
-  #onAttemptFailed(err) {
-    this.#stopPing();
-    if (!this.desired || this.state === "halted") return;
-    const se = this.#lastSessionError;
-    if (se && se.recoverable === false) {
-      this.#halt(`gateway rejected the session (${se.code})`);
-      return;
-    }
-    this.log(`connect failed: ${err.message}`);
-    if (
-      se?.code === "session_start_failed" &&
-      this.#attemptedResume &&
-      !this.#resumeFallbackUsed
-    ) {
-      // Saved session may be stale despite pre-validation; retry once fresh.
-      this.#resumeFallbackUsed = true;
-      this.#forceNew = true;
-      if (this.pinnedSessionId && this.pinnedSessionId === this.sessionId) {
-        // A focused session that cannot be resumed: drop the pin and tell the
-        // consumer so focus state is cleared loudly, never silently.
-        const sessionId = this.pinnedSessionId;
-        this.pinnedSessionId = null;
-        this.emit("resume-fallback", { sessionId });
-      }
-      this.#attempt();
-      return;
-    }
-    this.#scheduleReconnect();
-  }
-
-  #onClose(event) {
-    this.#stopPing();
-    if (!this.desired || this.state === "halted") return;
-    // Pre-ready closes surface through the connect() rejection path.
-    if (this.state !== "ready") return;
-    if (event.code === 1008) {
-      this.#halt(`gateway closed the connection (${event.code})`);
-      return;
-    }
-    this.log(`connection lost (close ${event.code})`);
-    this.emit("disconnected", event);
-    this.#scheduleReconnect();
-  }
-
-  #scheduleReconnect() {
-    if (this.#reconnectTimer) return;
-    const n = this.#failures++;
-    const exp = Math.min(this.backoffBaseMs * 2 ** n, this.backoffMaxMs);
-    const jitter = Math.floor(Math.random() * this.jitterMs);
-    const delay = Math.max(exp + jitter, this.#retryAfterFloorMs);
-    this.#retryAfterFloorMs = 0;
-    this.#setState("backoff");
-    this.emit("backoff", { delayMs: delay, failures: this.#failures });
-    this.#reconnectTimer = setTimeout(() => {
-      this.#reconnectTimer = null;
-      this.#attempt();
-    }, delay);
-    this.#reconnectTimer.unref?.();
+  #schedule() {
+    if (!this.desired || this.state === "halted" || this.#retry) return;
+    const delayMs = Math.max(Math.min(this.backoffBaseMs * 2 ** this.#failures++, this.backoffMaxMs)
+      + Math.floor(Math.random() * this.jitterMs), this.#retryAfter);
+    this.#retryAfter = 0;
+    this.#state("backoff");
+    this.emit("backoff", { delayMs, failures: this.#failures });
+    this.#retry = setTimeout(() => { this.#retry = null; this.#attempt(); }, delayMs);
+    this.#retry.unref?.();
   }
 
   #halt(reason) {
-    this.#stopPing();
-    clearTimeout(this.#reconnectTimer);
-    this.#reconnectTimer = null;
-    this.#setState("halted");
+    this.#state("halted");
+    void this.stop(reason);
     this.emit("halted", { reason });
   }
 
-  // --- ws-level liveness: the gateway never pings; we are the only heartbeat ---
-
-  #startPing() {
+  #startPing(socket) {
     this.#stopPing();
-    const ws = this.#rawSocket;
-    if (!ws) return;
-    this.#pingTimer = setInterval(() => {
-      if (ws.readyState !== WebSocket.OPEN) return;
-      ws.ping();
-      if (!this.#pongTimer) {
-        this.#pongTimer = setTimeout(() => {
-          this.#pongTimer = null;
-          this.log("liveness ping timed out; dropping the socket");
-          this.emit("ping-timeout");
-          ws.terminate();
-        }, this.pongTimeoutMs);
-        this.#pongTimer.unref?.();
-      }
+    this.#ping = setInterval(() => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      socket.ping();
+      if (!this.#pong) this.#pong = setTimeout(() => {
+        this.#pong = null;
+        this.emit("ping-timeout"); socket.terminate();
+      }, this.pongTimeoutMs);
+      this.#pong?.unref?.();
     }, this.pingIntervalMs);
-    this.#pingTimer.unref?.();
+    this.#ping.unref?.();
   }
-
   #stopPing() {
-    clearInterval(this.#pingTimer);
-    clearTimeout(this.#pongTimer);
-    this.#pingTimer = null;
-    this.#pongTimer = null;
-  }
-
-  // --- session persistence (atomic write-rename) ---
-
-  async #loadState() {
-    if (!this.stateFile) return;
-    try {
-      const data = JSON.parse(await readFile(this.stateFile, "utf8"));
-      if (typeof data.sessionId === "string" && data.sessionId) this.sessionId = data.sessionId;
-    } catch {
-      // missing or corrupt state file: start fresh
-    }
-  }
-
-  async #saveSessionId(sessionId) {
-    if (sessionId === this.sessionId) return;
-    this.sessionId = sessionId;
-    if (!this.stateFile) return;
-    try {
-      await mkdir(dirname(this.stateFile), { recursive: true });
-      const tmp = `${this.stateFile}.tmp-${process.pid}`;
-      await writeFile(tmp, JSON.stringify({ sessionId }), "utf8");
-      await rename(tmp, this.stateFile);
-    } catch (err) {
-      this.log(`state save failed: ${err.message}`);
-    }
+    clearInterval(this.#ping); clearTimeout(this.#pong);
+    this.#ping = this.#pong = null;
   }
 }

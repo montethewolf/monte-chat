@@ -47,6 +47,12 @@ function pcm24k(ms, freq = 440) {
   return buf.toString("base64");
 }
 
+function consume(bridge) {
+  const packet = bridge.nextPacket();
+  if (packet) bridge.markConsumed(packet);
+  return packet?.opus ?? null;
+}
+
 function inputMs(gw) {
   return gw.messages
     .filter((m) => m.type === "audio.input")
@@ -111,7 +117,7 @@ test("canned reply: audio.output becomes valid 20ms opus packets and player-run 
   gw.broadcast({ type: "response.completed", responseId: "resp_1" });
   await waitFor(() => !bridge.responseActive, "response completion");
   const packets = [];
-  for (let p = bridge.nextPacket(); p !== null; p = bridge.nextPacket()) packets.push(p);
+  for (let p = consume(bridge); p !== null; p = consume(bridge)) packets.push(p);
   assert.equal(packets.length, 25, "500ms should yield 25 packets");
   assert.ok(ran, "player-run should have fired");
   const dec = new OpusEncoder(48000, 2);
@@ -130,9 +136,10 @@ test("barge-in mid-playback truncates at the played position", async (t) => {
     contentIndex: 0,
   });
   await waitFor(() => bridge.responseActive, "response start");
-  await waitFor(() => bridge.nextPacket() !== null, "first packet");
-  for (let i = 0; i < 6; i++) bridge.nextPacket(); // 7 packets played = 140ms
-  bridge.onSpeakingStart();
+  await waitFor(() => consume(bridge) !== null, "first packet");
+  for (let i = 0; i < 6; i++) consume(bridge); // 7 packets played = 140ms
+  const sink = bridge.beginUtterance();
+  for (const packet of opusPackets(100)) sink.write(packet);
   const cancel = await waitFor(
     () => gw.messages.find((m) => m.type === "response.cancel"),
     "response.cancel",
@@ -153,10 +160,10 @@ test("audioEndMs is clamped: silence-fill frames never advance the ledger", asyn
     contentIndex: 0,
   });
   await waitFor(() => bridge.responseActive, "response start");
-  await waitFor(() => bridge.nextPacket() !== null, "first packet");
-  for (let i = 0; i < 4; i++) bridge.nextPacket(); // the remaining 4 real packets
+  await waitFor(() => consume(bridge) !== null, "first packet");
+  for (let i = 0; i < 4; i++) consume(bridge); // the remaining 4 real packets
   // response still active, queue dry -> silence fill keeps the player fed
-  for (let i = 0; i < 5; i++) assert.equal(bridge.nextPacket(), SILENCE_FRAME);
+  for (let i = 0; i < 5; i++) assert.equal(consume(bridge), SILENCE_FRAME);
   bridge.bargeIn();
   const cancel = await waitFor(
     () => gw.messages.find((m) => m.type === "response.cancel"),
@@ -180,8 +187,8 @@ test("response.failed flushes the queue and surfaces an error text", async (t) =
   await waitFor(() => bridge.playerShouldRun, "queued audio");
   gw.broadcast({ type: "response.failed", responseId: "resp_1", error: "provider exploded" });
   await waitFor(() => !bridge.playerShouldRun, "flush");
-  assert.equal(bridge.nextPacket(), null);
-  assert.ok(texts.some((e) => e.kind === "error" && e.text.includes("provider exploded")));
+  assert.equal(consume(bridge), null);
+  assert.ok(texts.some((e) => e.kind === "error" && e.text.includes("Voice response failed")));
 });
 
 test("input is refused when the gateway disables audio", async (t) => {
@@ -204,14 +211,14 @@ test("input.pause_requested aborts the utterance without audio.end; /join clears
   assert.ok(bridge.beginUtterance(), "input available again after clearing pause");
 });
 
-test("tiny utterances still commit >=100ms thanks to the end pad", async (t) => {
+test("a 20ms blip is discarded without upstream audio or commit", async (t) => {
   const { gw, bridge } = await setup(t);
   const sink = bridge.beginUtterance();
   for (const pkt of opusPackets(20)) sink.write(pkt);
   sink.end();
-  await waitFor(() => gw.messages.some((m) => m.type === "audio.end"), "audio.end");
-  const total = inputMs(gw);
-  assert.ok(total >= 100, `committed only ${total.toFixed(1)}ms — OpenAI would tear the session down`);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(inputMs(gw), 0);
+  assert.ok(!gw.messages.some((m) => m.type === "audio.end"));
 });
 
 test("task notifications and final transcripts mirror as text", async (t) => {

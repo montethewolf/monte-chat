@@ -153,9 +153,9 @@ export function readActiveWork(stateDbPath) {
   return withDb(stateDbPath, (db) => {
     const one = (sql) => {
       try {
-        return db.prepare(sql).get()?.n ?? 0;
+        return db.prepare(sql).get()?.n ?? null;
       } catch {
-        return 0;
+        return null;
       }
     };
     return {
@@ -204,7 +204,7 @@ export async function listRecentDiscordThreads({ hlvUrl, hlvToken, stateDbPath, 
     if (hlvToken) headers.Authorization = `Bearer ${hlvToken}`;
     const res = await fetch(
       `${scheme}://${base.host}/v1/conversations?limit=${limit}&source=discord`,
-      { headers, signal: AbortSignal.timeout(1500) },
+      { headers, signal: AbortSignal.timeout(1000) },
     );
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const body = await res.json();

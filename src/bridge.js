@@ -5,14 +5,16 @@
 //         -> on end: zero-pad flush (>= 100 ms commit guarantee) -> endAudio.
 // Output: audio.output PCM (rate parsed from mimeType) -> halfband interpolate
 //         -> stereo -> 960-sample/20 ms opus packets in one queue. Real packets
-//         advance a played-ms ledger keyed by itemId; barge-in cancels with
+//         carry source metadata; the playback adapter acknowledges consumption with
 //         audioEndMs clamped to what was actually received for that item.
 //
-// The bridge is transport-agnostic: index.js owns the Discord AudioPlayer and
-// pulls packets via nextPacket(); tests pull directly.
+// The bridge is transport-agnostic: playback.js owns the Discord AudioPlayer.
+// Pulling a packet does not imply playback; acknowledge it with markConsumed().
 
 import { EventEmitter } from "node:events";
 import mediaplex from "mediaplex";
+import { randomUUID } from "node:crypto";
+import { SpeechGate } from "./speech-gate.js";
 import { Decimator, Interpolator, monoToStereo, stereoToMono } from "./resample.js";
 
 const { OpusEncoder } = mediaplex;
@@ -70,17 +72,27 @@ export class Bridge extends EventEmitter {
   #assembling = null; // { itemId, contentIndex } the pending pcm belongs to
   #queue = []; // { opus, itemId, contentIndex }
   #queuedMs = 0;
-  #receivedMs = new Map(); // itemId -> total source ms received
-  #playedMs = new Map(); // itemId -> total source ms dequeued
-  #lastPlayed = null; // { itemId, contentIndex }
+  #generation = 0;
+  #response = null;
+  #responses = new Set();
+  #serial = 0;
+  #acceptOutput = false;
+  playback = null; // adapter: sync(), pending, stop()
   #badMimeWarned = false;
 
   // input
   #utterance = null;
+  #gateFactory;
+  #clock;
+  #trace = randomUUID();
+  #inputSerial = 0;
+  #connectionCount = 0;
 
-  constructor({ conn, frameMs = 50, endPadMs = 240, queueCapMs = 300_000, log = () => {} }) {
+  constructor({ conn, frameMs = 50, endPadMs = 240, queueCapMs = 300_000, log = () => {}, gateFactory = () => new SpeechGate(), clock = () => performance.now() }) {
     super();
     this.#conn = conn;
+    this.#gateFactory = gateFactory;
+    this.#clock = clock;
     this.#frameMs = frameMs;
     this.#endPadMs = endPadMs;
     this.#queueCapMs = queueCapMs;
@@ -88,19 +100,33 @@ export class Bridge extends EventEmitter {
 
     conn.on("ready", (ready) => this.#onReady(ready));
     conn.on("audio.output", (msg) => this.#onAudioOutput(msg));
-    conn.on("response.started", () => {
+    conn.on("response.started", (msg) => {
+      this.#flushPartial();
+      this.#assembling = null;
+      this.#response = { id: msg.responseId ?? ++this.#serial, items: new Map(), outstanding: 0, done: false, stats: { startedAt: this.#clock(), receivedMs: 0, consumedMs: 0, silenceMs: 0, underflows: 0, maxQueueMs: 0, empty: false, hadAudio: false } };
+      this.#responses.add(this.#response);
+      this.diagnostic("response_started", { responseId: this.#response.id });
+      this.#acceptOutput = true;
       this.responseActive = true;
       this.emit("player-run");
     });
-    conn.on("response.completed", () => {
+    const current = (msg) => !msg.responseId || msg.responseId === this.#response?.id;
+    conn.on("response.completed", (msg) => {
+      if (!current(msg)) return;
       this.responseActive = false;
+      this.#acceptOutput = false;
       this.#flushPartial();
-      if (this.#queue.length === 0) this.emit("player-stop");
+      if (this.#response) this.#response.done = true;
+      this.#prune();
+      this.emit("player-run"); // wake/drain; EOF must never force-stop buffered audio
     });
-    conn.on("response.cancelled", () => this.#dropResponse());
+    conn.on("response.cancelled", (msg) => {
+      if (current(msg)) this.#dropResponse("provider_cancelled");
+    });
     conn.on("response.failed", (msg) => {
-      this.#dropResponse();
-      this.emit("text", { kind: "error", text: `Response failed: ${msg.error}` });
+      if (!current(msg)) return;
+      this.#dropResponse("provider_failed");
+      this.emit("text", { kind: "error", text: "Voice response failed. Please try again." });
     });
     conn.on("input.pause_requested", () => {
       this.micPaused = true;
@@ -112,27 +138,27 @@ export class Bridge extends EventEmitter {
       if (msg.final) this.emit("text", { kind: "transcript", speaker: msg.speaker, text: msg.text });
     });
     conn.on("task.notification", (msg) => {
-      this.emit("text", { kind: "notification", text: msg.notification.message });
+      this.emit("text", { kind: "notification", key: `notification:${msg.taskId}:${msg.notification.notificationId}`, text: msg.notification.message });
     });
     conn.on("task.updated", ({ task }) => {
       if (task.state === "completed" || task.state === "failed" || task.state === "cancelled") {
         const detail = task.result?.summary ?? task.error?.message ?? "";
         this.emit("text", {
           kind: "task",
+          key: `task:${task.taskId}:${task.state}`,
           text: `Task ${task.state}: ${task.title ?? task.taskId}${detail ? ` — ${detail}` : ""}`,
         });
       }
     });
-    conn.on("disconnected", () => {
-      this.#abortUtterance();
-      this.#dropResponse();
-    });
+    conn.on("disconnected", () => { this.diagnostic("gateway_disconnected"); this.reset(); });
     conn.on("audio.dropped", (info) => this.#log(`input audio dropped (${info.reason})`));
   }
 
   #onReady(ready) {
+    this.reset();
+    this.diagnostic("gateway_ready", { connection: ++this.#connectionCount });
     const audio = ready.realtime?.audio ?? {};
-    const inputPcm = parsePcmRate(audio.input?.mimeType) !== null;
+    const inputPcm = parsePcmRate(audio.input?.mimeType) === HLV_RATE;
     this.#inputEnabled = Boolean(audio.input?.enabled) && inputPcm;
     this.#outputEnabled = Boolean(audio.output?.enabled);
     if (audio.input?.enabled && !inputPcm) {
@@ -142,6 +168,18 @@ export class Bridge extends EventEmitter {
     this.#abortUtterance();
     this.#dropResponse();
     this.#badMimeWarned = false;
+  }
+
+  diagnostic(event, fields = {}) {
+    this.#log(`voice ${JSON.stringify({ event, traceId: this.#trace, ...fields })}`);
+  }
+
+  #summarize(response, reason) {
+    const stats = response.stats;
+    this.diagnostic("response_summary", { responseId: response.id, reason,
+      elapsedMs: Math.round(this.#clock() - stats.startedAt), receivedMs: stats.receivedMs,
+      consumedMs: stats.consumedMs, insertedSilenceMs: stats.silenceMs,
+      underflows: stats.underflows, maxQueueMs: stats.maxQueueMs });
   }
 
   get playerShouldRun() {
@@ -159,7 +197,7 @@ export class Bridge extends EventEmitter {
   // --- output path ---
 
   #onAudioOutput({ data, mimeType, itemId, contentIndex }) {
-    if (!this.#outputEnabled) return;
+    if (!this.#outputEnabled || !this.#acceptOutput) return;
     const rate = parsePcmRate(mimeType);
     if (rate === null) {
       if (!this.#badMimeWarned) {
@@ -178,16 +216,21 @@ export class Bridge extends EventEmitter {
     const raw = Buffer.from(data, "base64");
     const pcm = int16View(raw);
     if (pcm.length === 0) return;
-    const key = itemId ?? null;
-    if (!this.#assembling || this.#assembling.itemId !== key) {
+    this.#response.stats.receivedMs += pcm.length / HLV_RATE * 1000;
+    const key = JSON.stringify([itemId ?? null, contentIndex ?? 0]);
+    if (!this.#assembling || this.#assembling.key !== key) {
       this.#flushPartial();
-      this.#assembling = { itemId: key, contentIndex: contentIndex ?? 0 };
+      let item = this.#response.items.get(key);
+      if (!item) {
+        item = { itemId: itemId ?? null, contentIndex: contentIndex ?? 0, received: 0, consumed: 0 };
+        this.#response.items.set(key, item);
+      }
+      this.#assembling = { key, item };
     }
-    if (itemId) {
-      this.#receivedMs.set(itemId, (this.#receivedMs.get(itemId) ?? 0) + (pcm.length / HLV_RATE) * 1000);
-    }
+    this.#assembling.item.received += pcm.length / HLV_RATE * 1000;
     if (this.#queuedMs >= this.#queueCapMs) {
-      this.#log("playback queue full; dropping output audio");
+      this.#log("playback queue full; cancelling response");
+      this.bargeIn("queue_full");
       return;
     }
     const stereo = monoToStereo(this.#interp.process(pcm));
@@ -201,40 +244,75 @@ export class Bridge extends EventEmitter {
     if (this.#queue.length > 0) this.emit("player-run");
   }
 
-  #enqueue(pcmStereo48k) {
+  #enqueue(pcmStereo48k, sourceMs = PACKET_MS) {
     const opus = this.#encoder.encode(int16ToBuffer(pcmStereo48k));
     this.#queue.push({
       opus,
-      itemId: this.#assembling?.itemId ?? null,
-      contentIndex: this.#assembling?.contentIndex ?? 0,
+      generation: this.#generation,
+      response: this.#response,
+      item: this.#assembling?.item,
+      sourceMs,
     });
     this.#queuedMs += PACKET_MS;
+    if (this.#response) {
+      this.#response.outstanding++;
+      this.#response.stats.maxQueueMs = Math.max(this.#response.stats.maxQueueMs, this.#queuedMs);
+    }
   }
 
   #flushPartial() {
     if (this.#pcmPending.length === 0) return;
     const padded = new Int16Array(FRAME_SAMPLES_48K * 2);
     padded.set(this.#pcmPending, 0);
-    this.#enqueue(padded);
+    this.#enqueue(padded, this.#pcmPending.length / 2 / OUT_RATE * 1000);
     this.#pcmPending = new Int16Array(0);
   }
 
-  // Pull the next 20 ms opus packet for playback. Within an active response an
-  // underflow yields a silence frame so the player never starves; when the
-  // response is over and the queue is dry it returns null (player stops).
+  // Stream prefetch only transfers ownership; it never credits consumption.
   nextPacket() {
     const pkt = this.#queue.shift();
     if (!pkt) {
-      if (this.responseActive) return SILENCE_FRAME;
-      this.emit("player-stop");
-      return null;
+      if (!this.responseActive) return null;
+      const stats = this.#response?.stats;
+      if (stats && !stats.empty) {
+        if (stats.hadAudio) stats.underflows++;
+        stats.empty = true;
+      }
+      return { opus: SILENCE_FRAME, sourceMs: 0, generation: this.#generation, silenceResponse: this.#response };
     }
+    pkt.response.stats.empty = false;
+    pkt.response.stats.hadAudio = true;
     this.#queuedMs -= PACKET_MS;
-    if (pkt.itemId) {
-      this.#playedMs.set(pkt.itemId, (this.#playedMs.get(pkt.itemId) ?? 0) + PACKET_MS);
-      this.#lastPlayed = { itemId: pkt.itemId, contentIndex: pkt.contentIndex };
+    return pkt;
+  }
+
+  markConsumed(pkt) {
+    if (pkt.generation !== this.#generation || pkt.consumed) return;
+    pkt.consumed = true;
+    if (pkt.item) pkt.item.consumed += pkt.sourceMs;
+    if (pkt.silenceResponse) pkt.silenceResponse.stats.silenceMs += PACKET_MS;
+    if (pkt.response) { pkt.response.outstanding--; pkt.response.stats.consumedMs += pkt.sourceMs; }
+    this.#prune();
+  }
+
+  #prune() {
+    for (const response of this.#responses) {
+      if (response.done && response.outstanding === 0) {
+        this.#summarize(response, "drained");
+        this.#responses.delete(response);
+        response.items.clear();
+        if (this.#response === response) this.#response = null;
+      }
     }
-    return pkt.opus;
+  }
+
+  get accountingSize() { return this.#responses.size; }
+
+  reset() {
+    this.#inputEnabled = false;
+    this.#outputEnabled = false;
+    this.#abortUtterance();
+    this.#dropResponse();
   }
 
   #clearQueue() {
@@ -245,7 +323,13 @@ export class Bridge extends EventEmitter {
     this.#interp = new Interpolator();
   }
 
-  #dropResponse() {
+  #dropResponse(reason = "reset") {
+    this.playback?.sync();
+    for (const response of this.#responses) this.#summarize(response, reason);
+    this.#generation++;
+    this.#acceptOutput = false;
+    this.#responses.clear();
+    this.#response = null;
     this.responseActive = false;
     this.#clearQueue();
     this.emit("player-stop");
@@ -253,32 +337,24 @@ export class Bridge extends EventEmitter {
 
   // --- barge-in ---
 
-  onSpeakingStart() {
-    if (this.responseActive || this.#queue.length > 0) this.bargeIn();
-  }
+  onSpeakingStart() {} // Discord packet activity is not evidence of speech.
 
-  bargeIn() {
-    if (!this.responseActive && this.#queue.length === 0) return false;
-    this.#clearQueue();
-    let truncate;
-    const last = this.#lastPlayed;
-    if (last?.itemId) {
-      const played = this.#playedMs.get(last.itemId) ?? 0;
-      const received = this.#receivedMs.get(last.itemId) ?? played;
-      truncate = {
-        itemId: last.itemId,
-        contentIndex: last.contentIndex ?? 0,
-        audioEndMs: Math.round(Math.min(played, received)),
-      };
-    }
-    this.#conn.cancelResponse("user_barge_in", truncate);
-    this.#log(
-      truncate
-        ? `barge-in: truncated ${truncate.itemId} at ${truncate.audioEndMs}ms`
-        : "barge-in: cancelled response (no itemId to truncate)",
-    );
-    this.responseActive = false; // server confirms with response.cancelled
-    this.emit("player-stop");
+  bargeIn(reason = "user_barge_in", evidence = {}) {
+    this.playback?.sync();
+    if (!this.responseActive && this.#queue.length === 0 && !this.playback?.pending) return false;
+    // The earliest unfinished response is the one currently audible. Never
+    // truncate a previously completed item merely because it played last.
+    const response = [...this.#responses].find((r) => r.outstanding > 0) ?? this.#response;
+    const items = [...(response?.items.values() ?? [])];
+    const item = items.find((i) => i.consumed < i.received) ?? items.at(-1);
+    const truncate = item?.itemId ? {
+      itemId: item.itemId,
+      contentIndex: item.contentIndex,
+      audioEndMs: Math.floor(Math.min(item.consumed, item.received)),
+    } : undefined;
+    this.diagnostic("interruption", { responseId: response?.id, reason, queuedMs: this.#queuedMs, ...evidence });
+    this.#conn.cancelResponse(reason, truncate);
+    this.#dropResponse(reason);
     return true;
   }
 
@@ -289,6 +365,11 @@ export class Bridge extends EventEmitter {
   // disabled, or another utterance is in flight).
   beginUtterance() {
     if (!this.#inputEnabled || this.micPaused || this.#utterance) return null;
+    const gate = this.#gateFactory();
+    const inputId = ++this.#inputSerial;
+    const responseId = this.#response?.id ?? null;
+    let lastPacketAt = null, maxGapMs = 0, decodedMs = 0, decodeErrors = 0;
+    const summary = (reason) => this.diagnostic("input_summary", { inputId, responseId, reason, voicedMs: gate.voicedMs, decodedMs, sentMs, maxGapMs: Math.round(maxGapMs), decodeErrors });
     const decoder = new OpusEncoder(OUT_RATE, 2);
     const decimator = new Decimator();
     const frameSamples = Math.round((this.#frameMs / 1000) * HLV_RATE);
@@ -299,38 +380,60 @@ export class Bridge extends EventEmitter {
       const id = this.#conn.sendAudio(int16ToBuffer(int16).toString("base64"), `audio/pcm;rate=${HLV_RATE}`);
       if (id !== undefined) sentMs += (int16.length / HLV_RATE) * 1000;
     };
+    const forward = (mono) => {
+      const down = decimator.process(mono);
+      pending = concatInt16([pending, down], pending.length + down.length);
+      let offset = 0;
+      while (pending.length - offset >= frameSamples) {
+        sendFrame(pending.subarray(offset, offset + frameSamples));
+        offset += frameSamples;
+      }
+      if (offset > 0) pending = pending.slice(offset);
+    };
     const utterance = {
       write: (opusPacket) => {
         if (this.#utterance !== utterance) return;
+        const now = this.#clock();
+        if (lastPacketAt !== null) {
+          const gap = now - lastPacketAt;
+          maxGapMs = Math.max(maxGapMs, gap);
+          if (gap > 100) gate.gap();
+        }
+        lastPacketAt = now;
         let pcm;
-        try {
-          pcm = decoder.decode(opusPacket);
-        } catch (err) {
-          this.#log(`opus decode failed: ${err.message}`);
+        try { pcm = decoder.decode(opusPacket); }
+        catch { decodeErrors++; gate.gap(); return; }
+        const mono = stereoToMono(int16View(pcm));
+        decodedMs += mono.length / OUT_RATE * 1000;
+        let result;
+        try { result = gate.push(mono); }
+        catch {
+          summary("detector_error");
+          this.#utterance = null;
+          this.emit("input-error"); // detach any partially sent upstream turn
           return;
         }
-        const mono = stereoToMono(int16View(pcm));
-        const down = decimator.process(mono);
-        pending = concatInt16([pending, down], pending.length + down.length);
-        let offset = 0;
-        while (pending.length - offset >= frameSamples) {
-          sendFrame(pending.subarray(offset, offset + frameSamples));
-          offset += frameSamples;
+        if (result.started) {
+          this.diagnostic("speech_confirmed", { inputId, responseId, voicedMs: gate.voicedMs });
+          this.bargeIn("user_barge_in", { inputId, voicedMs: gate.voicedMs });
         }
-        if (offset > 0) pending = pending.slice(offset);
+        for (const frame of result.frames) forward(frame);
       },
       end: () => {
         if (this.#utterance !== utterance) return;
         this.#utterance = null;
+        if (!gate.accepted) { summary("no_speech"); return; }
+        forward(gate.tail());
         sendFrame(pending);
         // Flush the FIR tail and guarantee the provider-side commit is
         // >= 100 ms; sent as one burst so it adds no real-time latency.
         sendFrame(new Int16Array(Math.round((this.#endPadMs / 1000) * HLV_RATE)));
         this.#conn.endAudio();
+        summary("committed");
         this.emit("utterance-end", { sentMs });
       },
       abort: () => {
-        if (this.#utterance === utterance) this.#utterance = null;
+        if (this.#utterance === utterance) { this.#utterance = null; summary("aborted"); }
       },
     };
     this.#utterance = utterance;
@@ -338,6 +441,6 @@ export class Bridge extends EventEmitter {
   }
 
   #abortUtterance() {
-    this.#utterance = null;
+    this.#utterance?.abort();
   }
 }

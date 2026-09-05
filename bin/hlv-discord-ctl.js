@@ -6,7 +6,7 @@
 // restart, applies mid-call.
 //
 //   hlv-discord-ctl mirror            -> print current mode
-//   hlv-discord-ctl mirror on|off|auto -> set mode
+//   hlv-discord-ctl mirror on|off -> set mode
 
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +16,7 @@ const MIRROR_STATE_FILE =
   process.env.MIRROR_STATE_FILE ?? join(homedir(), ".local", "state", "hlv-discord", "mirror.json");
 
 function usage() {
-  console.log("usage: hlv-discord-ctl mirror [on|off|auto|status]");
+  console.log("usage: hlv-discord-ctl mirror [on|off|status]");
   process.exit(2);
 }
 
@@ -24,11 +24,11 @@ const [cmd, arg] = process.argv.slice(2);
 if (cmd !== "mirror") usage();
 
 if (!arg || arg === "status") {
-  const mode = (await loadMirrorMode(MIRROR_STATE_FILE)) ?? "auto (default)";
-  console.log(`transcript mirroring: ${mode}`);
+  const mode = (await loadMirrorMode(MIRROR_STATE_FILE)) ?? normalizeMirrorMode(process.env.MIRROR_TRANSCRIPTS);
+  console.log(`voice conversation to text: ${mode}`);
   process.exit(0);
 }
 
-if (!MIRROR_MODES.includes(normalizeMirrorMode(arg, ""))) usage();
+if (!MIRROR_MODES.includes(arg)) usage();
 const mode = await saveMirrorMode(MIRROR_STATE_FILE, arg);
-console.log(`transcript mirroring: ${mode}`);
+console.log(`voice conversation to text: ${mode}`);
