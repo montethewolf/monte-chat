@@ -37,6 +37,23 @@ test("minimal brief keeps header, focus line, directive, and ack", () => {
   assert.match(brief, /Acknowledge now with only: "Ready\."/);
 });
 
+test("normal-budget briefs carry the approval-escalation guidance", () => {
+  const brief = buildBrief({ now: NOW });
+  assert.match(brief, /BLOCKED pending approval/);
+  assert.match(brief, /approve it from Discord text/);
+});
+
+test("approval guidance is dropped before the hard cut under extreme budgets", () => {
+  const brief = buildBrief({
+    now: NOW,
+    focus: { title: "T", messageCount: 1 },
+    maxChars: 550,
+  });
+  assert.ok(brief.length <= 550, `brief is ${brief.length} chars`);
+  assert.doesNotMatch(brief, /BLOCKED pending approval/);
+  assert.match(brief, /Acknowledge now with only: "Focused on T\."/);
+});
+
 test("cron failures come first with the error detail", () => {
   const brief = buildBrief({
     now: NOW,

@@ -110,10 +110,12 @@ export function buildBrief({
   });
   const { line: focusLine, ack } = focusBlock(focus);
   const header = `[SYSTEM BRIEF ${stamp} — not spoken by the user; context only]`;
+  const approvalPath =
+    "If a Hermes command is BLOCKED pending approval, tell the user: approve it from Discord text by asking Hermes there to re-run it; an \"always\" approval also unlocks voice permanently.";
   const directive =
     "Absorb silently. If details are needed later, ask Hermes via continue_hermes_conversation rather than guessing.";
 
-  const assemble = (threadCount, cronDetail) => {
+  const assemble = (threadCount, cronDetail, withApprovalPath) => {
     const lines = [header, gatewayLine(gateway), kanbanLine(kanban), cronLines(cron, nowMs, cronDetail), backgroundLine(activeWork)];
     if (threads.length > 0 && threadCount > 0) {
       lines.push('Recent Discord threads (Hermes has full history via continue_hermes_conversation):');
@@ -122,21 +124,27 @@ export function buildBrief({
         lines.push(`- ${t.title}${when}`);
       }
     }
-    lines.push(focusLine, directive, ack);
+    lines.push(focusLine, withApprovalPath ? approvalPath : null, directive, ack);
     return lines.filter(Boolean).join("\n");
   };
 
-  // Deterministic trim: drop thread items, then cron error detail, then hard cut.
+  // Deterministic trim: drop thread items, then cron error detail, then the
+  // approval-escalation guidance, then hard cut.
   let threadCount = threads.length;
   let cronDetail = true;
-  let text = assemble(threadCount, cronDetail);
+  let withApprovalPath = true;
+  let text = assemble(threadCount, cronDetail, withApprovalPath);
   while (text.length > maxChars && threadCount > 0) {
     threadCount -= 1;
-    text = assemble(threadCount, cronDetail);
+    text = assemble(threadCount, cronDetail, withApprovalPath);
   }
   if (text.length > maxChars && cronDetail) {
     cronDetail = false;
-    text = assemble(threadCount, cronDetail);
+    text = assemble(threadCount, cronDetail, withApprovalPath);
+  }
+  if (text.length > maxChars && withApprovalPath) {
+    withApprovalPath = false;
+    text = assemble(threadCount, cronDetail, withApprovalPath);
   }
   if (text.length > maxChars) {
     // Never cut the focus/directive/ack tail: trim the middle instead.
