@@ -32,6 +32,9 @@ Discord playback (barge-in cuts ≤200ms, truncation ledger keeps history honest
 - `src/brief.js` — pure assembly of the bounded call-start brief; `chunkText`.
 - `src/focus.js` — `/focus` state persistence (its own file, so hlv-conn's
   `state.json` rewrites can't clobber it).
+- `src/mirror.js` + `bin/hlv-discord-ctl.js` — transcript-mirroring policy
+  (on/off/auto) and the CLI that flips it; the service watches the state file
+  so changes apply mid-call.
 - `test/fake-gateway.js` — protocol-v6 fake; every frame self-validated with
   the SDK's `validateServerMessage`.
 
@@ -86,6 +89,25 @@ Caveats: background tasks run in fresh sessions and don't inherit the focused
 thread (the brief tells the model to pass key facts via `recent_voice_context`),
 and HLV's long-term memory scope stays its own (`X-Hermes-Session-Key` is not
 per-thread) — the transcript, which is what matters, is the thread's.
+
+## Transcript mirroring & voice permissions
+
+Mirroring modes: `on` (every final transcript line posts to the bound
+channel), `off`, and `auto` (default — only permission/approval exchanges
+post, with the triggering user line as context). Flip it any time with
+`hlv-discord-ctl mirror on|off|auto|status` (installed via `npm link`) or
+`/mirror`; the service watches `~/.local/state/hlv-discord/mirror.json` and
+applies changes mid-call. Saying "stop mirroring" *in voice* works because
+the brief tells the voice model to route it to Hermes, and a Hermes skill
+(`deploy/hermes-skill/SKILL.md`, installed at
+`~/.hermes/skills/hermes/hlv-discord-voice-bridge/`) teaches Hermes the CLI.
+
+Voice sessions ride Hermes' `api_server` platform, which is *unattended*:
+flagged commands are auto-denied (`approvals.unattended_mode`, default deny)
+and there is no interactive approval. The workflow: when voice hits a wall,
+auto-mirroring posts the exchange to the text channel — go there, ask Hermes
+to re-run it, and approve; an "always" approval lands in `command_allowlist`,
+which is checked *before* the unattended deny, so it unlocks voice too.
 
 ## Notes
 

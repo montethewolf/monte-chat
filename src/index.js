@@ -40,6 +40,9 @@ import {
   resolveThreadSession,
 } from "./hermes-status.js";
 import { clearFocus, loadFocus, saveFocus } from "./focus.js";
+import { MirrorFilter, loadMirrorMode, normalizeMirrorMode, saveMirrorMode } from "./mirror.js";
+import { watch } from "node:fs";
+import { basename, dirname } from "node:path";
 
 const { OpusEncoder } = mediaplex;
 
@@ -64,7 +67,10 @@ function readConfig() {
       process.env.HLV_STATE_FILE ?? join(homedir(), ".local", "state", "hlv-discord", "state.json"),
     silenceMs: Number(process.env.DISCORD_SILENCE_MS ?? 500),
     endPadMs: Number(process.env.HLV_END_PAD_MS ?? 240),
-    mirrorTranscripts: /^(1|true|yes)$/i.test(process.env.MIRROR_TRANSCRIPTS ?? ""),
+    mirrorDefault: normalizeMirrorMode(process.env.MIRROR_TRANSCRIPTS, "auto"),
+    mirrorStateFile:
+      process.env.MIRROR_STATE_FILE ??
+      join(homedir(), ".local", "state", "hlv-discord", "mirror.json"),
     textChannelId: process.env.DISCORD_TEXT_CHANNEL_ID || null,
     loopback: process.argv.includes("--loopback"),
     // Hermes state read-only paths (focus resolution + the call-start brief)
@@ -155,6 +161,7 @@ async function main() {
   const cfg = readConfig();
   const paths = hermesPaths(cfg);
   let focusState = await loadFocus(cfg.focusStateFile);
+  const mirror = new MirrorFilter((await loadMirrorMode(cfg.mirrorStateFile)) ?? cfg.mirrorDefault);
   if (focusState) log(`focus restored: thread ${focusState.threadId} ("${focusState.title ?? "?"}")`);
 
   // Boot check: DAVE (Discord E2EE) native binding must load, or every voice
@@ -276,10 +283,38 @@ async function main() {
     );
   }
 
-  bridge.on("text", ({ kind, text }) => {
-    if (kind === "transcript" && !cfg.mirrorTranscripts) return;
-    postText(kind === "transcript" ? text : `**${kind}**: ${text}`);
+  bridge.on("text", ({ kind, speaker, text }) => {
+    if (kind === "transcript") {
+      for (const line of mirror.decide(speaker, text)) postText(line);
+      return;
+    }
+    postText(`**${kind}**: ${text}`);
   });
+
+  // The mirror state file is the control surface: hlv-discord-ctl (run by
+  // Hermes on a spoken "stop mirroring", or by hand) rewrites it, and this
+  // watcher applies the change mid-call. Watch the directory — the file is
+  // replaced by atomic rename, which would orphan a file-level watcher.
+  {
+    const dir = dirname(cfg.mirrorStateFile);
+    const file = basename(cfg.mirrorStateFile);
+    let reloadTimer = null;
+    try {
+      watch(dir, (eventType, filename) => {
+        if (filename && filename !== file) return;
+        clearTimeout(reloadTimer);
+        reloadTimer = setTimeout(async () => {
+          const mode = await loadMirrorMode(cfg.mirrorStateFile);
+          if (mode === null || mode === mirror.mode) return;
+          mirror.setMode(mode);
+          log(`mirror mode -> ${mode} (state file)`);
+          postText(`**status**: transcript mirroring ${mode}`);
+        }, 150);
+      });
+    } catch (err) {
+      log(`mirror state watch failed (${err.message}); /mirror still works`);
+    }
+  }
 
   // Player runs only while the bridge has something to say; when nextPacket()
   // returns null the resource ends, the player idles, and the ring goes dark.
@@ -475,6 +510,23 @@ async function main() {
     await interaction.editReply("Brief re-sent.");
   }
 
+  async function handleMirror(interaction) {
+    const requested = interaction.options.getString("mode");
+    if (!requested) {
+      await interaction.reply({
+        content: `Transcript mirroring is **${mirror.mode}**.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const mode = mirror.setMode(requested);
+    await saveMirrorMode(cfg.mirrorStateFile, mode);
+    await interaction.reply({
+      content: `Transcript mirroring **${mode}**.`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
   client.on("interactionCreate", async (interaction) => {
     if (!interaction.isChatInputCommand() || interaction.guildId !== cfg.guildId) return;
     if (interaction.user.id !== cfg.userId) {
@@ -487,6 +539,7 @@ async function main() {
       else if (interaction.commandName === "focus") await handleFocus(interaction);
       else if (interaction.commandName === "unfocus") await handleUnfocus(interaction);
       else if (interaction.commandName === "brief") await handleBrief(interaction);
+      else if (interaction.commandName === "mirror") await handleMirror(interaction);
     } catch (err) {
       log(`command ${interaction.commandName} failed: ${err.message}`);
       if (interaction.deferred && !interaction.replied) {
@@ -513,6 +566,19 @@ async function main() {
       new SlashCommandBuilder()
         .setName("brief")
         .setDescription("Re-send Monte's status brief to the voice session"),
+      new SlashCommandBuilder()
+        .setName("mirror")
+        .setDescription("Voice transcript mirroring (no mode: show current)")
+        .addStringOption((o) =>
+          o
+            .setName("mode")
+            .setDescription("on = everything, off = nothing, auto = permission events only")
+            .addChoices(
+              { name: "on", value: "on" },
+              { name: "off", value: "off" },
+              { name: "auto", value: "auto" },
+            ),
+        ),
     ].map((c) => c.toJSON()),
   });
   log("slash commands registered");

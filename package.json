@@ -4,6 +4,9 @@
   "private": true,
   "description": "Discord voice <-> Hermes realtime bridge (via hermes-live-voice gateway)",
   "type": "module",
+  "bin": {
+    "hlv-discord-ctl": "bin/hlv-discord-ctl.js"
+  },
   "engines": {
     "node": ">=22.12"
   },
