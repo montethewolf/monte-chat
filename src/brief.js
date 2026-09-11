@@ -83,7 +83,7 @@ function focusBlock(focus) {
   return {
     line:
       `[voice focus: thread "${title}" — the Hermes conversation now IS that thread${msgs}. ` +
-      `Route follow-ups about it through continue_hermes_conversation; it has the full history. ` +
+      `Use the selected discussion history; consult Hermes for missing evidence. ` +
       `Background tasks do not inherit the thread — pass the relevant facts in recent_voice_context.]`,
     ack: `Acknowledge now with only: "Focused on ${title}."`,
   };
@@ -111,15 +111,15 @@ export function buildBrief({
   const { line: focusLine, ack } = focusBlock(focus);
   const header = `[SYSTEM BRIEF ${stamp} — not spoken by the user; context only]`;
   const guidance =
-    "If a Hermes command is BLOCKED pending approval, tell the user: approve it from Discord text by asking Hermes there to re-run it; an \"always\" approval also unlocks voice permanently. " +
-    "If the user asks to start/stop/change transcript mirroring, pass that to continue_hermes_conversation — Hermes has a CLI for it.";
+    "Hermes command approvals are presented in this call and through Discord buttons. Wait for an explicit answer; never suggest rerunning a pending command. " +
+    "Use the project catalog and discovery before asking for identifiers. Brainstorm consultations can query GitHub, Factory and CLI tools. Small explicitly requested actions retain Brainstorm.";
   const directive =
-    "Absorb silently. If details are needed later, ask Hermes via continue_hermes_conversation rather than guessing.";
+    "Absorb silently. Use consult_hermes for evidence in Brainstorm, Work tools for implementation, and local mode controls for mode changes.";
 
   const assemble = (threadCount, cronDetail, withGuidance) => {
     const lines = [header, gatewayLine(gateway), kanbanLine(kanban), cronLines(cron, nowMs, cronDetail), backgroundLine(activeWork)];
     if (threads.length > 0 && threadCount > 0) {
-      lines.push('Recent Discord threads (Hermes has full history via continue_hermes_conversation):');
+      lines.push('Recent Discord threads:');
       for (const t of threads.slice(0, threadCount)) {
         const when = t.lastActive ? ` (${age(t.lastActive, nowMs)})` : "";
         lines.push(`- ${t.title}${when}`);

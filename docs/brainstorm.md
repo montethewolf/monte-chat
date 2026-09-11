@@ -1,3 +1,7 @@
+# Current release
+
+The deployed v8 experience uses normal Hermes for Brainstorm consultations and supports command approvals in the call. See [normal Hermes access and deployment](natural-hermes.md). The v7 design and rollback instructions below are retained as historical reference for `monte.1` / `monte.2`.
+
 # Work and Brainstorm
 
 During a voice call, say “let’s brainstorm Monte Chat” or use `/mode mode:brainstorm project:Monte Chat`. Monte discusses directly with OpenAI Realtime. `/mode` reports mode, selected project, investigation, and ongoing Work tasks. `/mode mode:work` restores normal routing without submitting a task. “Implement option B” first switches to Work and then submits the explicit request with discussion context. Hypothetical implementation questions remain conversational.

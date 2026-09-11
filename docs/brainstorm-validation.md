@@ -1,5 +1,7 @@
 # Brainstorm release validation
 
+For the September 11 protocol v8 deployment, see [normal Hermes validation](natural-hermes-validation.md). The results below describe previous releases.
+
 ## September 7: focused-thread startup fix
 
 Current release: **`1.1.0-monte.2`**, fork commit `d607d33ec23f18c4c1b62979bac5ef3c1d34cce2`. A native Hermes thread contained a metadata-only `session_meta` row with null content. The HLV history parser rejected that row, preventing the voice session from starting even though service readiness checks passed. The parser now excludes those metadata records while retaining dialogue, session lineage, and validation of malformed conversation messages.

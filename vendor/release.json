@@ -1,11 +1,11 @@
 {
-  "version": "1.1.0-monte.2",
-  "protocolVersion": 7,
-  "sourceCommit": "d607d33ec23f18c4c1b62979bac5ef3c1d34cce2",
+  "version": "1.1.0-monte.3",
+  "protocolVersion": 8,
+  "sourceCommit": "169bca86d12bcae454f0243d05fa47f05cae3e79",
   "sourceCheckout": "/home/alex/Development/hermes-live-voice-monte",
   "upstreamBase": "ce16d93f475ad138a6efb018e4a0417c6c5a501c",
   "sha256": {
-    "hermes-live-voice-1.1.0-monte.2.tgz": "03e0161307266ced6339d33c787ab026e3165d5f2a868cfd33306b8fbee2e4f0",
-    "hermes-live-voice-1.1.0-monte.2-source.tar.gz": "c7c8eb4696fcd16eac17fcacdcc5290ffdd8fd10dea409c32939f82416a47d38"
+    "hermes-live-voice-1.1.0-monte.3.tgz": "9cfdf6167d9333d8e8c6e3e089975db06e05d8be44c5940993616321ed069362",
+    "hermes-live-voice-1.1.0-monte.3-source.tar.gz": "5426bf06c657fc770130fd32ef6fafe570913206453fddf6412b92dd83c59736"
   }
 }

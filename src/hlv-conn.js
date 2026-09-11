@@ -5,7 +5,7 @@ import { HermesLiveClient } from "hermes-live-voice/browser";
 
 const EVENTS = ["audio.output", "transcript.delta", "input.speech_started", "input.pause_requested",
   "response.started", "response.completed", "response.cancelled", "response.failed",
-  "task.notification", "task.updated", "audio.dropped", "session.mode.changed", "session.context.changed"];
+  "task.notification", "task.updated", "audio.dropped", "session.mode.changed", "session.context.changed", "task.approval.requested", "task.approval.resolved", "discussion.post.requested"];
 
 export class HlvConnection extends EventEmitter {
   #generation = 0;
@@ -125,13 +125,15 @@ export class HlvConnection extends EventEmitter {
     this.log(`mode confirmed: ${result.interactionMode}; latency_ms=${Math.round(performance.now() - started)}`);
     return result;
   }
-  async setDiscussion(discussionId, conversation) {
+  async setDiscussion(discussionId, conversation, origin) {
     if (!this.connected) throw new Error('Voice gateway is reconnecting');
-    const result = await this.client.setDiscussion(discussionId, conversation);
+    const result = await this.client.setDiscussion(discussionId, conversation, { origin: origin ?? this.prepareOrigin?.() });
     this.discussionId = result.discussionId;
     this.sessionId = result.conversation.sessionId;
     return result;
   }
+  respondApproval(...args) { if (!this.connected) return Promise.reject(new Error('Voice gateway is reconnecting; approval remains pending.')); return this.client.respondApproval(...args); }
+  reportPostResult(receipt, result) { if (this.connected) this.client.reportPostResult(receipt, result); }
   reportPlayback(active, microphoneActive) { if (this.connected) this.client.reportPlayback?.(active, microphoneActive); }
   sendContext(text) { return this.connected ? this.client.sendContext?.(text) : undefined; }
   sendText(text) { return this.connected ? this.client.sendText(text) : undefined; }
@@ -167,7 +169,7 @@ export class HlvConnection extends EventEmitter {
     this.#error = null;
     const conversation = target ? { mode: "resume", sessionId: target } : { mode: "new" };
     const client = new HermesLiveClient({
-      url: this.url, discussionId: this.prepareDiscussion?.() ?? this.discussionId, connectTimeoutMs: this.connectTimeoutMs, disconnectTimeoutMs: this.disconnectTimeoutMs,
+      url: this.url, origin: this.prepareOrigin?.(), discussionId: this.prepareDiscussion?.() ?? this.discussionId, connectTimeoutMs: this.connectTimeoutMs, disconnectTimeoutMs: this.disconnectTimeoutMs,
       webSocketFactory: (url) => {
         const socket = new WebSocket(url, { headers: this.token ? { Authorization: `Bearer ${this.token}` } : {} });
         socket.on("unexpected-response", (_req, res) => {

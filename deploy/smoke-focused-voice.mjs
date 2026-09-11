@@ -19,7 +19,7 @@ const client = new HermesLiveClient({ url: `ws://127.0.0.1:${config.server.port}
   discussionId: `diagnostic_${Date.now()}`, connectTimeoutMs: 15000,
   webSocketFactory: url => new WebSocket(url, { headers: config.server.authToken ? { Authorization: `Bearer ${config.server.authToken}` } : {} }) });
 let bytes = 0, firstAudioAt, audioEndedAt, completion = false, spokenText = '', inputText = '';
-let checkStarted = false, resumed = false;
+let checkStarted = false, resumed = false, expectedMode = '';
 const failures = [];
 client.on('session.error', event => failures.push(`${event.code}: ${event.message}`));
 client.on('audio.output', event => {
@@ -32,13 +32,14 @@ client.on('transcript.delta', event => {
   if (event.speaker === 'user') inputText = event.final ? event.text : inputText + event.text;
   else spokenText = event.final ? event.text : spokenText + event.text;
 });
-client.on('response.completed', () => { if (checkStarted && bytes > 0) completion = true; });
+client.on('response.completed', () => { if (checkStarted && bytes > 0 && expectedMode && spokenText.toLowerCase().includes(expectedMode)) completion = true; });
 client.on('task.accepted', () => { if (checkStarted) failures.push('Unexpected background task acceptance'); });
 try {
   const started = performance.now();
   const ready = await client.connect({ conversation: { mode: 'resume', sessionId } });
   resumed = true;
   const state = await client.setMode();
+  expectedMode = state.interactionMode;
   console.log(JSON.stringify({ connected: true, focused: Boolean(selection.focus), resumedSession: ready.conversation.sessionId, protocolVersion: ready.protocolVersion,
     mode: state.interactionMode, resumeMs: Math.round(performance.now() - started) }));
   if (process.argv.includes('--audio')) {
@@ -59,7 +60,7 @@ try {
     while (!completion && !failures.length && performance.now() < deadline) await new Promise(resolve => setTimeout(resolve, 100));
     if (!completion || !bytes || !/mode/i.test(inputText)) throw new Error(`Audio check incomplete: ${JSON.stringify({ bytes, completion, inputRecognized: /mode/i.test(inputText), failures })}`);
     console.log(JSON.stringify({ audioPassed: true, pcmBytes: bytes, firstAudioMs: Math.round(firstAudioAt - audioEndedAt),
-      inputRecognized: true, reply: spokenText.slice(0, 500) }));
+      inputRecognized: true, modeAnswerVerified: spokenText.toLowerCase().includes(expectedMode), reply: spokenText.slice(0, 500) }));
   }
   if (failures.length) throw new Error(failures.join('; '));
 } finally {

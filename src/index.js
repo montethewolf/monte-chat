@@ -31,6 +31,7 @@ import { watchMirrorMode } from "./mirror-watch.js";
 import { Playback } from "./playback.js";
 import { SessionStore } from "./session-store.js";
 import { StatusReader } from "./status-reader.js";
+import { DiscussionControls } from "./discussion-controls.js";
 import { DeliveryQueue } from "./delivery.js";
 import { CallController } from "./call-controller.js";
 import { MirrorFilter, loadMirrorMode, normalizeMirrorMode, saveMirrorMode } from "./mirror.js";
@@ -232,6 +233,14 @@ async function main() {
     delivery.enqueue({ text, target: mirrorTarget(), ...options });
   }
 
+  if (conn) conn.prepareOrigin = (selection) => {
+    const focus = selection ? selection.focus : controller.focusState;
+    const channelId = boundChannelId ?? controller.desiredChannel?.id;
+    return channelId ? { guildId: cfg.guildId, userId: cfg.userId, channelId, ...(focus?.threadId ? { threadId: focus.threadId } : {}) } : undefined;
+  };
+  const discussionControls = conn ? new DiscussionControls({ conn, client, userId: cfg.userId, guildId: cfg.guildId,
+    target: mirrorTarget, stateFile: `${cfg.stateFile}.posts.json`, log }) : null;
+
   const briefSender = new BriefSender({ conn, controller, status, enabled: cfg.briefEnabled,
     ttlMs: cfg.briefTtlMin * 60_000, maxChars: cfg.briefMaxChars, log });
 
@@ -422,6 +431,10 @@ async function main() {
   }
 
   client.on("interactionCreate", async (interaction) => {
+    if (interaction.isButton()) {
+      try { await discussionControls?.interaction(interaction); } catch { log('Command approval interaction failed'); }
+      return;
+    }
     if (!interaction.isChatInputCommand() || interaction.guildId !== cfg.guildId) return;
     if (interaction.user.id !== cfg.userId) {
       await interaction.reply({ content: "Not for you, sorry.", flags: MessageFlags.Ephemeral });

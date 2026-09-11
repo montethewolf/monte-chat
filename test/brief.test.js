@@ -37,10 +37,12 @@ test("minimal brief keeps header, focus line, directive, and ack", () => {
   assert.match(brief, /Acknowledge now with only: "Ready\."/);
 });
 
-test("normal-budget briefs carry the approval-escalation guidance", () => {
+test("normal-budget briefs explain in-call approvals and normal Hermes discovery", () => {
   const brief = buildBrief({ now: NOW });
-  assert.match(brief, /BLOCKED pending approval/);
-  assert.match(brief, /approve it from Discord text/);
+  assert.match(brief, /command approvals are presented in this call/);
+  assert.match(brief, /Discord buttons/);
+  assert.match(brief, /project catalog and discovery/);
+  assert.doesNotMatch(brief, /asking Hermes there to re-run/);
 });
 
 test("approval guidance is dropped before the hard cut under extreme budgets", () => {

@@ -179,7 +179,7 @@ export class CallController {
         return sid ? { mode: 'resume', sessionId: sid } : { mode: 'new' };
       };
       try {
-        const ready = await this.conn.setDiscussion(discussionIdForSelection(next), conversation(next));
+        const ready = await this.conn.setDiscussion(discussionIdForSelection(next), conversation(next), this.conn.prepareOrigin?.(next));
         signal.throwIfAborted();
         if (generation !== this.generation) throw new Error('Call changed during context switch');
         if (next.focus) next.focus.sessionId = ready.conversation.sessionId;
@@ -188,7 +188,7 @@ export class CallController {
         this.selection = next;
       } catch (error) {
         if (signal.aborted) throw error;
-        await this.conn.setDiscussion(discussionIdForSelection(previous), conversation(previous)).catch(() => this.conn.stop('context rollback failed'));
+        await this.conn.setDiscussion(discussionIdForSelection(previous), conversation(previous), this.conn.prepareOrigin?.(previous)).catch(() => this.conn.stop('context rollback failed'));
         this.selection = previous;
         this.notice('Conversation switch failed; previous selection preserved.');
         throw error;
