@@ -87,6 +87,7 @@ export class Bridge extends EventEmitter {
   #trace = randomUUID();
   #inputSerial = 0;
   #connectionCount = 0;
+  #lastTurnEnd = null;
 
   constructor({ conn, frameMs = 50, endPadMs = 240, queueCapMs = 300_000, log = () => {}, gateFactory = () => new SpeechGate(), clock = () => performance.now() }) {
     super();
@@ -154,8 +155,13 @@ export class Bridge extends EventEmitter {
     conn.on("audio.dropped", (info) => this.#log(`input audio dropped (${info.reason})`));
   }
 
+  reportPlayback() {
+    this.#conn.reportPlayback?.(this.playerShouldRun || Boolean(this.playback?.active), Boolean(this.#utterance));
+  }
+
   #onReady(ready) {
     this.reset();
+    queueMicrotask(() => this.reportPlayback());
     this.diagnostic("gateway_ready", { connection: ++this.#connectionCount });
     const audio = ready.realtime?.audio ?? {};
     const inputPcm = parsePcmRate(audio.input?.mimeType) === HLV_RATE;
@@ -216,6 +222,10 @@ export class Bridge extends EventEmitter {
     const raw = Buffer.from(data, "base64");
     const pcm = int16View(raw);
     if (pcm.length === 0) return;
+    if (this.#lastTurnEnd !== null) {
+      this.diagnostic('turn_first_audio', { inputId: this.#inputSerial, latencyMs: Math.round(this.#clock() - this.#lastTurnEnd) });
+      this.#lastTurnEnd = null;
+    }
     this.#response.stats.receivedMs += pcm.length / HLV_RATE * 1000;
     const key = JSON.stringify([itemId ?? null, contentIndex ?? 0]);
     if (!this.#assembling || this.#assembling.key !== key) {
@@ -410,6 +420,7 @@ export class Bridge extends EventEmitter {
         catch {
           summary("detector_error");
           this.#utterance = null;
+          this.reportPlayback();
           this.emit("input-error"); // detach any partially sent upstream turn
           return;
         }
@@ -422,21 +433,24 @@ export class Bridge extends EventEmitter {
       end: () => {
         if (this.#utterance !== utterance) return;
         this.#utterance = null;
+        queueMicrotask(() => this.reportPlayback());
         if (!gate.accepted) { summary("no_speech"); return; }
         forward(gate.tail());
         sendFrame(pending);
         // Flush the FIR tail and guarantee the provider-side commit is
         // >= 100 ms; sent as one burst so it adds no real-time latency.
         sendFrame(new Int16Array(Math.round((this.#endPadMs / 1000) * HLV_RATE)));
+        this.#lastTurnEnd = this.#clock();
         this.#conn.endAudio();
         summary("committed");
         this.emit("utterance-end", { sentMs });
       },
       abort: () => {
-        if (this.#utterance === utterance) { this.#utterance = null; summary("aborted"); }
+        if (this.#utterance === utterance) { this.#utterance = null; this.reportPlayback(); summary("aborted"); }
       },
     };
     this.#utterance = utterance;
+    this.reportPlayback();
     return utterance;
   }
 

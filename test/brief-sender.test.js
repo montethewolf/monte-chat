@@ -26,3 +26,12 @@ test("same-session reconnect is throttled, focus change and explicit refresh are
   assert.equal(await sender.send(), true);
   assert.equal(await sender.send(null, true), true); assert.equal(sent.length, 3);
 });
+
+
+test('v7 briefs insert labelled context without a synthetic user turn', async () => {
+  const contexts = [], userTurns = [];
+  const conn = { connected: true, generation: 1, sessionId: 'a', session: { protocolVersion: 7 },
+    sendContext: text => contexts.push(text), sendText: text => userTurns.push(text) };
+  const sender = new BriefSender({ conn, controller: { generation: 1, focusState: null }, status: { snapshot: async () => ({}) } });
+  assert.equal(await sender.send(), true); assert.equal(contexts.length, 1); assert.equal(userTurns.length, 0);
+});

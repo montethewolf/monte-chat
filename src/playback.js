@@ -23,7 +23,7 @@ export class Playback {
       this.resource = null;
       this.descriptors = [];
       clearInterval(this.timer);
-      if (!this.stopping) queueMicrotask(() => this.start());
+      if (!this.stopping) queueMicrotask(() => { this.start(); this.bridge.reportPlayback?.(); });
     };
     player.on("stateChange", this.onState);
     this.onError = () => {
@@ -33,6 +33,8 @@ export class Playback {
     player.on("error", this.onError);
     this.tickMs = tickMs;
   }
+
+  get active() { return Boolean(this.resource) || this.player.state.status !== AudioPlayerStatus.Idle; }
 
   get pending() { return this.descriptors.some((p) => p.sourceMs > 0); }
 
@@ -62,6 +64,7 @@ export class Playback {
     });
     this.resource = createAudioResource(stream, { inputType: StreamType.Opus });
     this.player.play(this.resource);
+    this.bridge.reportPlayback?.();
     this.timer = setInterval(() => this.sync(), this.tickMs);
     this.timer.unref?.();
   }
@@ -75,6 +78,7 @@ export class Playback {
     this.resource = null;
     this.descriptors = [];
     this.stopping = false;
+    this.bridge.reportPlayback?.();
   }
 
   dispose() {

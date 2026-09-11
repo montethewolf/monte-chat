@@ -17,11 +17,11 @@ async function until(fn) {
   const end = Date.now() + 3000;
   while (!fn()) { if (Date.now() > end) throw new Error("Timed out waiting for call"); await new Promise((r) => setTimeout(r, 5)); }
 }
-async function setup(t) {
+async function setup(t, behavior = {}) {
   const dir = await mkdtemp(join(tmpdir(), "voice-call-"));
   const store = new SessionStore(join(dir, "state.json")); await store.load();
-  await store.save({ version: 2, defaultSessionId: "default", focus: null });
-  const gw = new FakeGateway(); await gw.listen();
+  await store.save({ ...store.value, defaultSessionId: "default" });
+  const gw = new FakeGateway({ behavior }); await gw.listen();
   const conn = new HlvConnection({ url: gw.url, backoffBaseMs: 10, jitterMs: 0 });
   const bridge = new Bridge({ conn }); const playback = new Playback({ bridge, player: createAudioPlayer() });
   const notices = []; const voices = []; let aborts = 0;
@@ -144,4 +144,47 @@ test("persistence failure rolls focus back before any new-session events are for
   await assert.rejects(controller.focus("a")); await until(() => conn.connected);
   assert.equal(store.value.focus, null); assert.ok(!emitted.includes("session-a"));
   assert.equal(gw.starts.at(-1).conversation.sessionId, "default");
+});
+
+
+test('v7 mode and focus controls preserve the Discord and realtime connections', async t => {
+  const { controller, conn, store, gw, voices } = await setup(t, { protocolVersion: 7 });
+  await assert.rejects(controller.mode(), /Join a voice call/);
+  await controller.join({ id: 'voice' });
+  const discussionId = store.value.defaultDiscussionId;
+  assert.equal((await controller.mode('brainstorm')).interactionMode, 'brainstorm');
+  await controller.focus('a');
+  assert.equal(conn.session.discussionId, 'discord:a');
+  assert.equal(conn.session.interactionMode, 'brainstorm');
+  assert.equal(store.value.defaultDiscussionId, discussionId);
+  await controller.unfocus();
+  assert.equal(conn.session.discussionId, discussionId);
+  await controller.newConversation();
+  assert.notEqual(store.value.defaultDiscussionId, discussionId);
+  assert.equal(conn.session.interactionMode, 'brainstorm');
+  assert.equal(gw.starts.length, 1); assert.equal(voices.length, 1);
+  assert.equal(gw.messages.some(m => m.type === 'text.input'), false);
+});
+test('v7 failed mode confirmation retains the confirmed mode and dispatches nothing', async t => {
+  const { controller, conn, gw } = await setup(t, { protocolVersion: 7 });
+  await controller.join({ id: 'voice' });
+  gw.behavior.failMode = true;
+  await assert.rejects(controller.mode('brainstorm'), /Provider rejected/);
+  assert.equal(conn.session.interactionMode, 'work');
+  assert.equal(gw.messages.some(m => m.type === 'text.input' || m.type === 'task.follow_up'), false);
+});
+test('v6 gateways report mode controls as unsupported explicitly', async t => {
+  const { controller } = await setup(t);
+  await controller.join({ id: 'voice' });
+  await assert.rejects(controller.mode('brainstorm'), /unsupported/);
+});
+test('v7 failed focus persistence rolls context back within the same live connection', async t => {
+  const { controller, conn, gw, store } = await setup(t, { protocolVersion: 7 });
+  await controller.join({ id: 'voice' });
+  const previous = conn.session.discussionId;
+  const save = store.save.bind(store);
+  store.save = (next, opts) => { if (next.focus) return Promise.reject(new Error('Disk unavailable')); return save(next, opts); };
+  await assert.rejects(controller.focus('a'));
+  assert.equal(conn.session.discussionId, previous);
+  assert.equal(store.value.focus, null); assert.equal(gw.starts.length, 1);
 });

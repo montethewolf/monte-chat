@@ -26,6 +26,7 @@ export class FakeGateway {
       audioEnabled: true,
       ...options.behavior,
     };
+    this.interactionMode = 'work';
     this.starts = []; // session.start messages, across connections
     this.messages = []; // every client message, across connections
     this.upgradeUrls = [];
@@ -81,6 +82,17 @@ export class FakeGateway {
       this.messages.push(msg);
       this.onMessage?.(ws, msg);
       if (msg.type === "session.start") this.#onSessionStart(ws, msg);
+      else if (msg.type === 'session.mode.set') {
+        if (this.behavior.failMode) { this.send(ws, { type: 'session.error', requestId: msg.id, code: 'mode_switch_failed', message: 'Provider rejected mode update', recoverable: true }); return; }
+        this.interactionMode = msg.interactionMode ?? this.interactionMode;
+        this.send(ws, { type: 'session.mode.changed', requestId: msg.id, interactionMode: this.interactionMode, discussionId: ws.discussionId,
+          brainstormSupported: true, ongoingWork: 0, ...(msg.project ? { project: msg.project } : {}) });
+      }
+      else if (msg.type === 'session.context.set') {
+        ws.discussionId = msg.discussionId;
+        this.send(ws, { type: 'session.context.changed', requestId: msg.id, discussionId: msg.discussionId,
+          conversation: { mode: msg.conversation.mode, sessionId: msg.conversation.sessionId ?? `sess_${++seq}` } });
+      }
       else if (msg.type === "session.close") ws.close(1000, "detached");
     });
   }
@@ -114,9 +126,11 @@ export class FakeGateway {
     }
     seq += 1;
     const sessionId = conv.mode === "resume" ? conv.sessionId : `sess_${seq}`;
+    ws.discussionId = msg.discussionId ?? 'discussion_fake';
     this.send(ws, {
       type: "session.ready",
-      protocolVersion: 6,
+      protocolVersion: this.behavior.protocolVersion ?? 6,
+      ...(this.behavior.protocolVersion === 7 ? { interactionMode: this.interactionMode, discussionId: ws.discussionId, brainstormSupported: true } : {}),
       requestId: msg.id,
       sessionId: `live_${seq}`,
       model: "fake-realtime",

@@ -221,3 +221,7 @@ The bridge sends and accepts 24 kHz mono PCM and performs its own halfband
 filtering. `mediaplex` decoding produces 48 kHz stereo, which is downmixed
 explicitly. Unsupported advertised input formats disable input rather than
 sending audio at the wrong rate.
+
+## Conversational brainstorming
+
+Use `/mode` during a call to inspect or switch Work/Brainstorm. Say “let’s brainstorm Monte Chat” to select a project, or “implement option B” to switch to Work with the saved design context. See [behavior, configuration, rollout and rollback](docs/brainstorm.md) and [validation](docs/brainstorm-validation.md). The SDK and gateway use the matching HLV fork release `1.1.0-monte.2`.

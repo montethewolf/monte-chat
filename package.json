@@ -17,7 +17,7 @@
   "dependencies": {
     "@discordjs/voice": "^0.19.2",
     "discord.js": "^14.27.0",
-    "hermes-live-voice": "^1.1.0",
+    "hermes-live-voice": "file:vendor/hermes-live-voice-1.1.0-monte.2.tgz",
     "mediaplex": "^1.0.0",
     "webrtcvad": "1.0.1",
     "ws": "^8.21.3"

@@ -25,7 +25,10 @@ test("migration preserves focused target and true default despite a mismatched l
 });
 test("default-only migration and fresh installations", async (t) => {
   const { path, store } = await setup(t);
-  assert.deepEqual(await store.load(), { version: 2, defaultSessionId: null, focus: null });
+  const initial = await store.load();
+  assert.equal(initial.version, 3); assert.equal(initial.defaultSessionId, null); assert.equal(initial.focus, null);
+  assert.match(initial.defaultDiscussionId, /^discussion_[a-f0-9]{32}$/);
+  const reconnect = new SessionStore(path); await reconnect.load(); assert.equal(reconnect.value.defaultDiscussionId, initial.defaultDiscussionId);
   await writeFile(path, JSON.stringify({ sessionId: "saved" }));
   assert.equal((await store.load()).defaultSessionId, "saved");
 });

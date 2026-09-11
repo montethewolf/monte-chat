@@ -18,7 +18,8 @@ export class BriefSender {
     const data = await this.status.snapshot(force);
     if (generation !== conn.generation || callGeneration !== controller.generation || !conn.connected) return false;
     const brief = buildBrief({ ...data, now: new Date(), focus, maxChars: this.maxChars });
-    if (conn.sendText(brief) === undefined) return false;
+    const sent = conn.session?.protocolVersion >= 7 ? conn.sendContext(brief) : conn.sendText(brief);
+    if (sent === undefined) return false;
     this.lastKey = key; this.lastAt = Date.now();
     this.log(`brief sent (${brief.length} chars)`);
     return true;

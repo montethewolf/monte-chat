@@ -397,6 +397,14 @@ async function main() {
     await interaction.editReply(sent ? "Brief re-sent." : "Brief not sent: disabled or call changed.");
   }
 
+  async function handleMode(interaction) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    try {
+      const state = await controller.mode(interaction.options.getString('mode') ?? undefined, interaction.options.getString('project') ?? undefined);
+      await interaction.editReply(`Mode: **${state.interactionMode}**. Project: **${state.project ?? 'none selected'}**. Investigation: ${state.investigation ?? 'none'}.${state.ongoingWork ? ` ${state.ongoingWork} Work task(s) continue.` : ''}`);
+    } catch (error) { await interaction.editReply(error.message); }
+  }
+
   async function handleMirror(interaction) {
     const requested = interaction.options.getString("mode");
     if (!requested) {
@@ -426,6 +434,7 @@ async function main() {
       else if (interaction.commandName === "unfocus") await handleUnfocus(interaction);
       else if (interaction.commandName === "brief") await handleBrief(interaction);
       else if (interaction.commandName === "new-conversation") await handleNewConversation(interaction);
+      else if (interaction.commandName === "mode") await handleMode(interaction);
       else if (interaction.commandName === "mirror") await handleMirror(interaction);
     } catch (err) {
       log(`command ${interaction.commandName} failed: ${err.message}`);
@@ -442,6 +451,9 @@ async function main() {
   const rest = new REST().setToken(cfg.token);
   await rest.put(Routes.applicationGuildCommands(cfg.appId, cfg.guildId), {
     body: [
+      new SlashCommandBuilder().setName('mode').setDescription('Inspect or change Work/Brainstorm mode during a voice call')
+        .addStringOption(o => o.setName('mode').setDescription('Conversation mode').addChoices({ name: 'work', value: 'work' }, { name: 'brainstorm', value: 'brainstorm' }))
+        .addStringOption(o => o.setName('project').setDescription('Registered project name for the discussion')),
       new SlashCommandBuilder().setName("join").setDescription("Join your voice channel and listen"),
       new SlashCommandBuilder().setName("leave").setDescription("Leave the voice channel"),
       new SlashCommandBuilder().setName("new-conversation").setDescription("Explicitly start fresh and clear focus; background tasks continue"),

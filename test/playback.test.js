@@ -110,3 +110,18 @@ test("player failure cancels response without permanently disabling microphone",
   assert.equal(bridge.responseActive, false); assert.equal(bridge.inputEnabled, true);
   assert.ok(bridge.beginUtterance());
 });
+
+
+test('playback state remains active after provider completion until Discord drains', async t => {
+  const { conn, player, start, audio, complete, bridge } = setup(t, NoSubscriberBehavior.Play);
+  const states = []; conn.reportPlayback = (active, microphoneActive) => states.push({ active, microphoneActive });
+  start(); audio(120); complete();
+  assert.equal(bridge.responseActive, false);
+  assert.equal(states.at(-1).active, true);
+  await until(() => player.state.status === AudioPlayerStatus.Idle);
+  await tick();
+  assert.equal(states.at(-1).active, false);
+  const sink = bridge.beginUtterance();
+  assert.equal(states.at(-1).microphoneActive, true);
+  sink.abort(); assert.equal(states.at(-1).microphoneActive, false);
+});

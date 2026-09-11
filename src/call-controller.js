@@ -1,3 +1,4 @@
+import { newDiscussionId, discussionIdForSelection } from "./session-store.js";
 // Owns user intent, voice resources, and committed session selection. Transports
 // and state readers are injected so races can be exercised without Discord.
 export class CallController {
@@ -9,6 +10,7 @@ export class CallController {
     this.tail = Promise.resolve(); this.abort = new AbortController(); this.generation = 0;
     this.retryFailures = 0;
     if (conn) {
+      conn.prepareDiscussion = () => discussionIdForSelection(this.selection);
       conn.prepareSession = async (signal) => {
         const focus = this.selection.focus;
         if (focus) {
@@ -133,6 +135,9 @@ export class CallController {
   }
 
   changeSelection(makeSelection, { fresh = false } = {}) {
+    if (this.ready && this.conn?.session?.protocolVersion >= 7 && this.conn.session.brainstormSupported) {
+      return this.changeLiveSelection(makeSelection);
+    }
     return this.operate(async (signal) => {
       const previous = structuredClone(this.store.value);
       try {
@@ -162,6 +167,42 @@ export class CallController {
     });
   }
 
+  changeLiveSelection(makeSelection) {
+    const generation = ++this.generation;
+    const signal = this.abort.signal;
+    const operation = this.tail.then(async () => {
+      const previous = structuredClone(this.store.value);
+      const next = await makeSelection(previous, signal);
+      signal.throwIfAborted();
+      const conversation = value => {
+        const sid = value.focus?.sessionId ?? value.defaultSessionId;
+        return sid ? { mode: 'resume', sessionId: sid } : { mode: 'new' };
+      };
+      try {
+        const ready = await this.conn.setDiscussion(discussionIdForSelection(next), conversation(next));
+        signal.throwIfAborted();
+        if (generation !== this.generation) throw new Error('Call changed during context switch');
+        if (next.focus) next.focus.sessionId = ready.conversation.sessionId;
+        else next.defaultSessionId = ready.conversation.sessionId;
+        await this.store.save(next, { signal });
+        this.selection = next;
+      } catch (error) {
+        if (signal.aborted) throw error;
+        await this.conn.setDiscussion(discussionIdForSelection(previous), conversation(previous)).catch(() => this.conn.stop('context rollback failed'));
+        this.selection = previous;
+        this.notice('Conversation switch failed; previous selection preserved.');
+        throw error;
+      }
+    });
+    this.tail = operation.catch(() => {});
+    return operation;
+  }
+
+  async mode(mode, project) {
+    if (!this.ready || !this.conn) throw new Error('Join a voice call to inspect or change the active mode.');
+    return this.conn.setMode(mode, { project });
+  }
+
   focus(threadId) {
     return this.changeSelection(async (previous, signal) => {
       const resolved = await this.status.resolve(threadId, signal);
@@ -171,7 +212,7 @@ export class CallController {
   }
   unfocus() { return this.changeSelection((previous) => ({ ...previous, focus: null })); }
   newConversation() {
-    return this.changeSelection(() => ({ version: 2, defaultSessionId: null, focus: null }), { fresh: true });
+    return this.changeSelection(() => ({ version: 3, defaultDiscussionId: newDiscussionId(), defaultSessionId: null, focus: null }), { fresh: true });
   }
   async close() {
     await this.leave("service shutdown");

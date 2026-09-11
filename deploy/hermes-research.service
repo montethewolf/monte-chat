@@ -1,0 +1,26 @@
+[Unit]
+Description=Monte Chat restricted Hermes repository research
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.hermes/hermes-agent/venv/bin/python %h/Development/monte-chat/deploy/research/run.py
+Environment=HERMES_HOME=%h/.hermes-research
+Environment=HERMES_RESEARCH_SOURCE=%h/.hermes/hermes-agent
+Environment=HERMES_LIVE_REPOSITORY_REGISTRY=%h/.hermes/hermes-live/repositories.json
+EnvironmentFile=%h/.hermes-research/.env
+WorkingDirectory=%h/.hermes-research
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:%h/.hermes-research/logs/gateway.log
+StandardError=inherit
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=%h/.hermes-research
+ReadOnlyPaths=%h/Development %h/.hermes/hermes-agent %h/.hermes/hermes-live/repositories.json
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
