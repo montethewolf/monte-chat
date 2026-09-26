@@ -1,5 +1,10 @@
 # Voice reliability validation
 
+For a fresh installation, use the [README](../README.md) first. This checklist
+supplements its first-call checks. Release-specific prior measurements are in
+[normal Hermes validation](natural-hermes-validation.md); they do not certify
+a new user's host or headset.
+
 ## Automated checks
 
 Run `npm ci` and `npm test` in a checkout. Tests use local fake gateways and
@@ -12,8 +17,9 @@ implementations of their buffering or protocol behavior.
 Use a test conversation/thread and avoid requesting consequential actions.
 Run only one bridge instance for the Discord application at a time.
 
-1. Join from the Discord mobile app. Verify "Ready." is audible in full and
-   `/join` reports listening only after both connections are ready. Test short
+1. Join from the Discord mobile app. Ask a question and verify the reply is audible
+   in full; v8 context insertion does not guarantee a spoken "Ready." greeting.
+   Verify `/join` reports listening only after both connections are ready. Test short
    replies and multi-sentence replies for missing starts or clipped endings.
 2. Interrupt before a reply begins, during speech, and near its end. Verify
    playback stops and subsequent conversation does not assume you heard the
@@ -71,15 +77,17 @@ buffering are outside this change.
 
 Before restarting into this revision, stop the old service and back up its
 configured state and focus files. Keep the old checkout/package lock available.
-The new service reads legacy state and writes version 2 on its next state commit;
-its first legacy overwrite also preserves `state.json.legacy` (or the equivalent
-configured path). It leaves the legacy focus file untouched.
+The current service uses version 3 with a stable default discussion ID. Version-2
+records are migrated on load; legacy `{sessionId}` and separate focus records are
+also imported. The first legacy overwrite preserves `state.json.legacy` (or the
+equivalent configured path). The old focus file is left untouched.
 
-To roll back, stop the service, restore the old checkout/dependencies, and restore
-the pre-upgrade state/focus files together before restarting. Do not feed the
-version-2 record to the old service: it expects `{sessionId}`. Backups represent
-the pre-upgrade selection; later session/focus changes require deliberate
-selection after rollback. Mirror mode remains in its separate unchanged format.
+For release rollback, follow the [current release instructions](natural-hermes.md#deployment-and-rollback)
+and use the matching gateway/SDK pair. Do not feed newer state to older software
+or restore an old task-state snapshot over work accepted since the backup. The
+v8-to-v7 helper preserves current task state; a rollback to older bridge selection
+formats additionally needs the appropriate selection conversion. Mirror mode
+remains in its separate file.
 
 This implementation does not automatically deploy, restart services, run live
 provider probes, or modify Hermes/HLV installations.

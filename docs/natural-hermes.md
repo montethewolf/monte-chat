@@ -1,5 +1,11 @@
 # Project context and normal Hermes access
 
+For a fresh installation on another user's Hermes, follow the
+[README](../README.md) and [service instructions](services.md). The deployment
+and rollback steps below describe the maintainer's existing installation, not
+prerequisites for new users. In particular, new v8 installs need no legacy
+research service or normal-profile repair override.
+
 Release `1.1.0-monte.3` pairs the HLV gateway and SDK on protocol v8. Brainstorm consultations now use the ordinary Hermes service and profile, including its CLI, GitHub login, skills and existing approval rules. They return a receipt immediately, leaving voice conversation available. The separate restricted researcher remains available for previously accepted research and v7 clients; v8 never routes new consultations there.
 
 The initial discussion includes an 8,000-character project catalog: readable names, short descriptions, local paths, normalized GitHub remotes and Factory associations. `list_projects` discovers additional matches. The catalog refreshes in the background every five minutes and on context changes or unresolved selections. `consult_hermes` can investigate without a selected project. The Factory registry entry identifies its configured target repository and `factoryq` path; Factory issue numbers refer to that target, not necessarily Monte Factory's source repository.

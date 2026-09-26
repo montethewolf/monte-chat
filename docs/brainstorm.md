@@ -1,5 +1,8 @@
 # Current release
 
+**New installations:** use the [README](../README.md). Do not follow the v7
+research-profile setup below for a fresh v8 installation.
+
 The deployed v8 experience uses normal Hermes for Brainstorm consultations and supports command approvals in the call. See [normal Hermes access and deployment](natural-hermes.md). The v7 design and rollback instructions below are retained as historical reference for `monte.1` / `monte.2`.
 
 # Work and Brainstorm
